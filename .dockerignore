@@ -1,0 +1,7 @@
+**/.venv
+**/__pycache__
+**/.pytest_cache
+data/
+backend/.env
+backend/benchmark/images
+*.bak-*.xlsx

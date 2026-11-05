@@ -1,0 +1,27 @@
+# docker compose up -d   ->  http://IP-VPS:8000  (nên đặt sau nginx + HTTPS, xem deploy/linux/nginx-sale-manager.conf)
+# Mặc định SQLite trong volume "sale-data". Muốn PostgreSQL: bỏ chú thích khối "db" và SALE_DB_URL bên dưới.
+services:
+  app:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:8000:8000"
+    environment:
+      SALE_DB_URL: sqlite:////data/sale.db
+      # SALE_DB_URL: postgresql+psycopg://sale:doi-mat-khau@db:5432/sale
+    volumes:
+      - sale-data:/data
+      - ./backend/.env:/app/backend/.env:ro     # khóa AI, SALE_AUTH_USERS... (tạo từ backend/.env.example)
+  # db:
+  #   image: postgres:16
+  #   restart: unless-stopped
+  #   environment:
+  #     POSTGRES_USER: sale
+  #     POSTGRES_PASSWORD: doi-mat-khau
+  #     POSTGRES_DB: sale
+  #     POSTGRES_INITDB_ARGS: "--encoding=UTF8 --locale=C.UTF-8"
+  #   volumes:
+  #     - pg-data:/var/lib/postgresql/data
+volumes:
+  sale-data:
+  # pg-data:

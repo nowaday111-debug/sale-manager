@@ -1,0 +1,17 @@
+# Dữ liệu & bí mật – KHÔNG đưa lên GitHub
+data/
+backend/.env
+backend/.env - Copy.example
+*.db
+*.db-wal
+*.db-shm
+*.bak-*.xlsx
+# Môi trường / bộ nhớ đệm
+.venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+backend/benchmark/results/
+node_modules/
+# Ảnh phiếu thật dùng để đo độ chính xác AI – không đưa lên GitHub công khai
+backend/benchmark/images/

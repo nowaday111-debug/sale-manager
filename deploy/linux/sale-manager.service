@@ -1,0 +1,26 @@
+# /etc/systemd/system/sale-manager.service – tạo tự động bởi deploy/linux/install.sh
+[Unit]
+Description=Sale-manager (FastAPI) – quan ly ban hang, giao nhan, cong no
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=salemgr
+Group=salemgr
+WorkingDirectory=/opt/sale-manager/backend
+EnvironmentFile=-/opt/sale-manager/backend/.env
+Environment=PYTHONUNBUFFERED=1
+# 1 worker: SQLite ghi tuần tự an toàn. Dùng PostgreSQL thì có thể tăng --workers 2-4.
+ExecStart=/opt/sale-manager/backend/.venv/bin/python -m uvicorn app.main:app --host 127.0.0.1 --port 8000 --proxy-headers --forwarded-allow-ips=127.0.0.1 --workers 1
+Restart=always
+RestartSec=3
+# Bảo mật hệ thống
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/sale-manager/data /opt/sale-manager/backend
+
+[Install]
+WantedBy=multi-user.target

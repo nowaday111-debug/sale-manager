@@ -1,0 +1,3 @@
+# Chỉ cần khi dùng PostgreSQL (SALE_DB_URL=postgresql+psycopg://...)
+-r requirements.txt
+psycopg[binary]>=3.1
