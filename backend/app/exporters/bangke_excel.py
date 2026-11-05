@@ -387,7 +387,7 @@ class SheetWriter:
         self.words_formula(words_row, f"{lay.L(lay.net)}{words_row + 1}", last_print + 8)
         return last_print
 
-    def words_formula(self, words_row: int, amount_ref: str, base: int):
+    def words_formula(self, words_row: int, amount_ref: str, base: int, target_col: int = FIRST_COL + 2):
         """Chép khối công thức đọc số thành chữ của file gốc vào vùng ẩn (dòng base..base+5)."""
         ws = self.ws
         r0, r1, r2, r3, r4, r5 = range(base, base + 6)
@@ -422,7 +422,7 @@ class SheetWriter:
         for r in range(r0, r5 + 1):
             ws.row_dimensions[r].hidden = True
         # ô "Bằng chữ" tham chiếu khối công thức – giống file gốc (=D125)
-        ws.cell(words_row, FIRST_COL + 2).value = f"=D{r5}"
+        ws.cell(words_row, target_col).value = f"=D{r5}"
 
     def page_setup(self, last_row: int):
         ws, lay = self.ws, self.lay
@@ -469,6 +469,9 @@ def _capacities(session: Session, skus: list[str]) -> dict[str, Decimal]:
 
 
 def render_sheet(ws: Worksheet, st: dict, capacities: dict[str, Decimal]) -> dict:
+    if st.get("template") == "VAT_DETAIL":
+        from .bangke_vat_excel import VatSheetWriter
+        return VatSheetWriter(ws, st, capacities).write()
     return SheetWriter(ws, st, capacities).write()
 
 
@@ -483,7 +486,7 @@ def _unique_sheet_title(wb, title: str) -> str:
 
 def _is_month_sheet(name: str) -> bool:
     import re
-    return bool(re.fullmatch(r"T\d{1,2}\.\d{4}( \(\d+\))?", name.strip()))
+    return bool(re.fullmatch(r"T\d{1,2}\.\d{4}( \(\d+\))?( .*)?", name.strip()))
 
 
 def build_workbook_bytes(session: Session, partner_id: int, period: str, *, sign_date: date | None = None) -> tuple[bytes, str]:

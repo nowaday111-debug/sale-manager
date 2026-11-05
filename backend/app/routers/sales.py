@@ -56,6 +56,12 @@ def cancel_slip(slip_id: int, body: ReasonIn, session: Session = Depends(get_ses
     return _slip_result(sales.cancel_slip(session, slip_id, body.reason))
 
 
+@router.delete("/slips/{slip_id}")
+def delete_slip(slip_id: int, reason: Optional[str] = None, session: Session = Depends(get_session)):
+    """Xóa hẳn phiếu. Phiếu đã ghi sổ được tự đảo kho / vỏ mượn / công nợ trước khi xóa."""
+    return sales.delete_slip(session, slip_id, reason=reason)
+
+
 @router.get("/reports/gross-profit")
 def gross_profit(date_from: date, date_to: date, partner_id: Optional[int] = None,
                  session: Session = Depends(get_session)):

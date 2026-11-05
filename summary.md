@@ -1,4 +1,4 @@
-# Sale-manager – Tóm tắt dự án (cập nhật 05/11/2026, XONG Phase 1–7: Đơn hàng → BBGN → Đối chiếu công nợ, giao diện mới, chạy Linux/VPS)
+# Sale-manager – Tóm tắt dự án (cập nhật 05/11/2026, XONG Phase 1–8: … + thuế GTGT riêng, mẫu bảng kê Welstory, xóa khách/phiếu)
 
 > Dán file này vào đầu session mới để tiếp tục. Code nằm ở `D:\chị Hiền nhờ viết app\Sale-manage\sale-manager`
 > (`backend/` Python, `frontend/` giao diện, các file `.bat` để chạy trên Windows). Hướng dẫn chi tiết: `backend/README.md`.
@@ -97,11 +97,29 @@ tôn trọng reduced-motion, chạy được trên điện thoại.
 tùy chọn PostgreSQL), `Dockerfile`, `docker-compose.yml`, `chay.sh`, `requirements-postgres.txt`; đăng nhập HTTP Basic
 `app/auth.py` (`SALE_AUTH_USERS`, mật khẩu băm PBKDF2, vai trò theo tài khoản). 68 test qua trên SQLite **và** PostgreSQL 16.
 
+**Phase 8 – Thuế GTGT riêng + mẫu Welstory + xóa** (05/11/2026)
+- Mẫu mới "BẢNG KÊ CHI TIẾT" tách thuế (file Welstory, Cty CP Metro Toàn Cầu bán): `app/exporters/bangke_vat_excel.py`
+  (A Ngày | Loại bình | Gas dư | Thực giao | Đơn giá chưa thuế | Thành tiền chưa thuế | Thuế GTGT 8% | Tổng cộng | Ghi chú;
+  công thức `=+B18*45-C18`, `=+D18*E18`, `=F18*8%`, `=F18+G18`). Xuất T10.2026 → LibreOffice tính lại **khớp từng ô** với file gốc
+  (H27 = 250.640.374,572; bằng chữ giống hệt). Demo: `app/demo/welstory_t10.py`.
+- Khách: `vat_mode` (INCLUDED | EXCLUDED), `statement_template` (STANDARD | VAT_DETAIL), `statement_cut_day` (25 → kỳ 26/09–25/10,
+  áp dụng cho kỳ phiếu, khóa sổ, phân bổ thanh toán, bảng kê), `seller_company_id` (nhiều đơn vị bán: bảng `company_profile`,
+  API `/api/companies`, Cài đặt → Đơn vị bán hàng khác). Phiếu: `vat_mode`, `vat_rate`, `amount_before_tax`, `vat_amount`.
+  Migration `m0002`.
+- Chị chọn **giữ số lẻ như file mẫu**: tiền chưa thuế / thuế lưu số lẻ; thành tiền phiếu làm tròn LŨY KẾ trong kỳ
+  (`sales.rebalance_vat_period`) nên tổng công nợ kỳ = đúng số Excel; từng phiếu có thể ±1 đ.
+- Lập phiếu: chọn cách tính thuế/thuế suất, hiện Tiền chưa thuế – Thuế – Tổng. Bảng giá: nhãn "Giá CHƯA thuế" với khách tách thuế.
+- Xóa khách/NCC (`DELETE /api/partners/{id}`, `/usage`): chưa có chứng từ → xóa hẳn; đã có → chặn, cho "Ngừng theo dõi"
+  (is_active=false, xem lại bằng tick "Hiện cả đối tác đã ngừng theo dõi", bật lại được).
+- Xóa phiếu (`DELETE /api/slips/{id}`): mọi trạng thái; phiếu đã ghi sổ tự đảo kho/vỏ/công nợ; chặn khi kỳ khóa sổ hoặc có phiếu thu kèm.
+- 7 test mới `tests/test_vat_welstory.py`; 75 test qua trên SQLite và PostgreSQL 16 (2 test OCR cần ảnh benchmark).
+- Còn mở: nhập lịch sử từ file Welstory (bộ đọc Excel hiện chỉ hiểu mẫu Stargate); sheet "BBGN" trong file Welstory chưa làm mẫu riêng.
+
 ## 4. Cách chạy
 Người dùng (Windows): cài Python 3.11+ → nháy đúp `cai-dat.bat` (1 lần) → `chay.bat` → http://127.0.0.1:8000
 ```
 cd sale-manager/backend && python -m venv .venv && .venv\Scripts\activate && pip install -r requirements.txt
-python -m pytest -q                                     # 70 test (2 test OCR cần ảnh benchmark)
+python -m pytest -q                                     # 77 test (2 test OCR cần ảnh benchmark)
 python -m scripts.seed_demo                             # DB demo Stargate T10
 python -m scripts.seed_order_demo                       # DB demo quy trình đơn hàng (data/demo-orders.db)
 python -m scripts.export_bangke --demo                  # xuất bảng kê demo -> data/exports/

@@ -15,6 +15,8 @@ from ..models import (
     CompanyProfile,
     Partner,
     PartnerType,
+    StatementTemplate,
+    VatMode,
     PriceBasis,
     PriceList,
     Product,
@@ -49,14 +51,60 @@ def normalize_tax_code(tax_code) -> str | None:
 
 # ---------------------------------------------------------------- công ty
 def get_company(session: Session) -> CompanyProfile:
-    company = session.scalar(select(CompanyProfile).limit(1))
+    """Công ty chính (dòng đầu tiên). Các đơn vị bán hàng khác là các dòng tiếp theo."""
+    company = session.scalar(select(CompanyProfile).order_by(CompanyProfile.id).limit(1))
     if company is None:
         raise BusinessError("Chưa khai báo thông tin công ty (company_profile)")
     return company
 
 
+def get_seller_for(session: Session, partner: Partner) -> CompanyProfile:
+    """Đơn vị bán hàng in trên bảng kê của khách: theo khai báo của khách, mặc định là công ty chính."""
+    if partner.seller_company_id:
+        company = session.get(CompanyProfile, partner.seller_company_id)
+        if company is not None:
+            return company
+    return get_company(session)
+
+
+def list_companies(session: Session) -> list[CompanyProfile]:
+    return list(session.scalars(select(CompanyProfile).order_by(CompanyProfile.id)))
+
+
+def create_company(session: Session, **fields) -> CompanyProfile:
+    if not (fields.get("name") or "").strip():
+        raise BusinessError("Thiếu tên đơn vị bán hàng")
+    company = CompanyProfile(**fields)
+    company.tax_code = normalize_tax_code(fields.get("tax_code"))
+    session.add(company)
+    session.flush()
+    return company
+
+
+def update_company(session: Session, company_id: int, **fields) -> CompanyProfile:
+    company = session.get(CompanyProfile, company_id)
+    if company is None:
+        raise NotFoundError("đơn vị bán hàng", company_id)
+    for k, v in fields.items():
+        setattr(company, k, normalize_tax_code(v) if k == "tax_code" else v)
+    session.flush()
+    return company
+
+
+def delete_company(session: Session, company_id: int) -> None:
+    company = session.get(CompanyProfile, company_id)
+    if company is None:
+        raise NotFoundError("đơn vị bán hàng", company_id)
+    if company.id == get_company(session).id:
+        raise BusinessError("Không xóa được công ty chính (dòng đầu tiên) – chỉ sửa thông tin")
+    for p in session.scalars(select(Partner).where(Partner.seller_company_id == company_id)):
+        p.seller_company_id = None
+    session.delete(company)
+    session.flush()
+
+
 def upsert_company(session: Session, **fields) -> CompanyProfile:
-    company = session.scalar(select(CompanyProfile).limit(1))
+    company = session.scalar(select(CompanyProfile).order_by(CompanyProfile.id).limit(1))
     if company is None:
         company = CompanyProfile(**fields)
         session.add(company)
@@ -73,9 +121,15 @@ def upsert_company(session: Session, **fields) -> CompanyProfile:
 def create_partner(session: Session, *, code: str, name: str, partner_type: str = PartnerType.CUSTOMER,
                    tax_code=None, address=None, phone=None, contact_name=None, credit_limit=None,
                    workbook_path=None, note=None, payment_term_days: int = 30, email=None, representative=None,
-                   representative_title=None) -> Partner:
+                   representative_title=None, vat_mode: str = VatMode.INCLUDED,
+                   statement_template: str | None = None, statement_cut_day: int | None = None,
+                   seller_company_id: int | None = None) -> Partner:
     if partner_type not in PartnerType.ALL:
         raise BusinessError(f"Loại đối tác không hợp lệ: {partner_type}")
+    statement_template = statement_template or (
+        StatementTemplate.VAT_DETAIL if vat_mode == VatMode.EXCLUDED else StatementTemplate.STANDARD)
+    _check_statement_fields(session, vat_mode=vat_mode, statement_template=statement_template,
+                            statement_cut_day=statement_cut_day, seller_company_id=seller_company_id)
     code = code.strip().upper()
     if session.scalar(select(Partner).where(Partner.code == code)):
         raise DuplicateError(f"Mã đối tác {code} đã tồn tại")
@@ -86,14 +140,35 @@ def create_partner(session: Session, *, code: str, name: str, partner_type: str 
                       address=address, phone=phone, contact_name=contact_name,
                       credit_limit=D(credit_limit) if credit_limit is not None else None,
                       workbook_path=workbook_path, note=note, payment_term_days=payment_term_days, email=email,
-                      representative=representative, representative_title=representative_title)
+                      representative=representative, representative_title=representative_title,
+                      vat_mode=vat_mode, statement_template=statement_template,
+                      statement_cut_day=statement_cut_day or None, seller_company_id=seller_company_id)
     session.add(partner)
     session.flush()
     return partner
 
 
+def _check_statement_fields(session: Session, **f) -> None:
+    if f.get("vat_mode") is not None and f["vat_mode"] not in VatMode.ALL:
+        raise BusinessError(f"Cách tính thuế không hợp lệ: {f['vat_mode']}")
+    if f.get("statement_template") is not None and f["statement_template"] not in StatementTemplate.ALL:
+        raise BusinessError(f"Mẫu bảng kê không hợp lệ: {f['statement_template']}")
+    cut = f.get("statement_cut_day")
+    if cut not in (None, 0) and not 1 <= int(cut) <= 27:
+        raise BusinessError("Ngày chốt bảng kê phải từ 1 đến 27 (để trống = hết tháng)")
+    if f.get("seller_company_id") and session.get(CompanyProfile, f["seller_company_id"]) is None:
+        raise NotFoundError("đơn vị bán hàng", f["seller_company_id"])
+
+
 def update_partner(session: Session, partner_id: int, **fields) -> Partner:
     partner = get_partner(session, partner_id)
+    _check_statement_fields(session, **{k: v for k, v in fields.items()
+                                        if k in ("vat_mode", "statement_template", "statement_cut_day",
+                                                 "seller_company_id")})
+    if fields.get("statement_cut_day") == 0:
+        fields["statement_cut_day"] = None
+    if "statement_cut_day" in fields and fields["statement_cut_day"] != partner.statement_cut_day:
+        _ensure_cut_day_change_safe(session, partner)
     for key, value in fields.items():
         if key == "tax_code":
             value = normalize_tax_code(value)
@@ -104,6 +179,90 @@ def update_partner(session: Session, partner_id: int, **fields) -> Partner:
         setattr(partner, key, value)
     session.flush()
     return partner
+
+
+def _ensure_cut_day_change_safe(session: Session, partner: Partner) -> None:
+    """Đổi ngày chốt kỳ làm thay đổi kỳ của phiếu cũ – không cho đổi khi đã có bảng kê khóa sổ."""
+    from ..models import Statement, StatementStatus
+    locked = session.scalar(select(Statement.period).where(Statement.partner_id == partner.id,
+                                                           Statement.status == StatementStatus.CONFIRMED).limit(1))
+    if locked:
+        raise BusinessError(f"Khách đã có bảng kê khóa sổ (kỳ {locked}) – mở khóa trước khi đổi ngày chốt kỳ")
+
+
+# Chứng từ phát sinh: có 1 trong các loại này thì không xóa hẳn đối tác (chỉ ngừng theo dõi)
+def partner_usage(session: Session, partner_id: int) -> dict[str, int]:
+    from sqlalchemy import func
+
+    from ..models import (
+        AssetMovement,
+        CashVoucher,
+        DebtLedgerEntry,
+        DebtReconciliation,
+        DeliveryNote,
+        DeliverySlip,
+        OpeningBalance,
+        Order,
+        PaymentAllocation,
+        Purchase,
+        Statement,
+        VatInvoice,
+    )
+    checks = [
+        ("phiếu bán hàng", DeliverySlip, DeliverySlip.partner_id),
+        ("phiếu mua hàng", Purchase, Purchase.supplier_id),
+        ("phiếu thu/chi", CashVoucher, CashVoucher.partner_id),
+        ("phân bổ thanh toán", PaymentAllocation, PaymentAllocation.partner_id),
+        ("hóa đơn GTGT", VatInvoice, VatInvoice.partner_id),
+        ("vỏ/thiết bị", AssetMovement, AssetMovement.partner_id),
+        ("nợ đầu kỳ", OpeningBalance, OpeningBalance.partner_id),
+        ("bảng kê", Statement, Statement.partner_id),
+        ("đơn đặt hàng", Order, Order.partner_id),
+        ("biên bản giao nhận", DeliveryNote, DeliveryNote.partner_id),
+        ("bút toán công nợ", DebtLedgerEntry, DebtLedgerEntry.partner_id),
+        ("biên bản đối chiếu", DebtReconciliation, DebtReconciliation.partner_id),
+    ]
+    out = {}
+    for label, model, col in checks:
+        n = session.scalar(select(func.count()).select_from(model).where(col == partner_id)) or 0
+        if n:
+            out[label] = n
+    return out
+
+
+def delete_partner(session: Session, partner_id: int, *, deactivate_if_used: bool = False) -> dict:
+    """Xóa khách hàng / NCC.
+
+    - Chưa có chứng từ: xóa hẳn (kèm bếp, tên gọi khác, bảng giá riêng, ánh xạ mã hàng NCC).
+    - Đã có chứng từ: không xóa (giữ sổ sách đúng). deactivate_if_used=True thì chuyển sang "ngừng theo dõi"
+      (ẩn khỏi danh sách, bật lại được), ngược lại báo lỗi kèm số chứng từ.
+    """
+    from ..models import OcrJob, SupplierProductMap
+
+    partner = get_partner(session, partner_id)
+    used = partner_usage(session, partner_id)
+    if used:
+        detail = ", ".join(f"{n} {label}" for label, n in used.items())
+        if not deactivate_if_used:
+            raise BusinessError(f"{partner.name} đã có {detail} nên không xóa được. "
+                                "Có thể chọn 'Ngừng theo dõi' để ẩn khỏi danh sách.", code="partner_in_use")
+        partner.is_active = False
+        session.flush()
+        return {"deleted": False, "deactivated": True, "usage": used}
+    for row in session.scalars(select(PriceList).where(PriceList.partner_id == partner_id)):
+        session.delete(row)
+    for row in session.scalars(select(SupplierProductMap).where(SupplierProductMap.supplier_id == partner_id)):
+        session.delete(row)
+    for job in session.scalars(select(OcrJob).where(OcrJob.partner_id == partner_id)):
+        job.partner_id = None
+    for site in list(partner.sites):
+        for al in session.scalars(select(SiteAlias).where(SiteAlias.site_id == site.id)):
+            session.delete(al)
+        session.delete(site)
+    session.flush()
+    session.delete(partner)
+    session.flush()
+    return {"deleted": True, "deactivated": False, "usage": {}}
 
 
 def get_partner(session: Session, partner_id: int) -> Partner:
@@ -120,8 +279,11 @@ def find_partner_by_tax_code(session: Session, tax_code) -> Partner | None:
     return session.scalar(select(Partner).where(Partner.tax_code == tax))
 
 
-def list_partners(session: Session, *, partner_type: str | None = None, q: str | None = None) -> list[Partner]:
-    stmt = select(Partner).where(Partner.is_active.is_(True)).order_by(Partner.name)
+def list_partners(session: Session, *, partner_type: str | None = None, q: str | None = None,
+                  include_inactive: bool = False) -> list[Partner]:
+    stmt = select(Partner).order_by(Partner.name)
+    if not include_inactive:
+        stmt = stmt.where(Partner.is_active.is_(True))
     if partner_type == PartnerType.CUSTOMER:
         stmt = stmt.where(Partner.partner_type.in_([PartnerType.CUSTOMER, PartnerType.BOTH]))
     elif partner_type == PartnerType.SUPPLIER:

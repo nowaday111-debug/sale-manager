@@ -43,6 +43,27 @@ class PriceBasis:
     ALL = {KG, UNIT}
 
 
+class VatMode:
+    """Cách khách tính thuế GTGT."""
+    INCLUDED = "INCLUDED"   # đơn giá đã gồm VAT (mặc định – như Stargate)
+    EXCLUDED = "EXCLUDED"   # đơn giá CHƯA thuế, cộng tiền thuế GTGT riêng (khách yêu cầu – như Welstory)
+    ALL = {INCLUDED, EXCLUDED}
+
+
+class StatementTemplate:
+    STANDARD = "STANDARD"       # mẫu Stargate: khối theo bếp, số HĐ, nợ cũ + thanh toán
+    VAT_DETAIL = "VAT_DETAIL"   # mẫu Welstory: đơn giá chưa thuế | thành tiền chưa thuế | thuế GTGT | tổng cộng
+    ALL = {STANDARD, VAT_DETAIL}
+
+
+def period_for(d, cut_day: int | None = None) -> str:
+    """Kỳ bảng kê của một ngày. cut_day=25: kỳ T10 = 26/09 → 25/10 (ngày > 25 thuộc kỳ tháng sau)."""
+    y, m = d.year, d.month
+    if cut_day and 1 <= cut_day < 28 and d.day > cut_day:
+        y, m = (y + 1, 1) if m == 12 else (y, m + 1)
+    return f"{y:04d}-{m:02d}"
+
+
 class SlipType:
     SALE = "SALE"
     RETURN_SALE = "RETURN_SALE"
@@ -142,6 +163,7 @@ class CompanyProfile(Base):
     bank_name: Mapped[str | None] = mapped_column(String(200))
     contact_line: Mapped[str | None] = mapped_column(String(300))     # "Mr. Khánh: 0968.97.2011 ..."
     sign_city: Mapped[str] = mapped_column(String(60), default="Hà Nội")
+    short_name: Mapped[str | None] = mapped_column(String(100))       # tên ngắn để chọn (VD: "Toàn Cầu")
 
 
 class Partner(Base):
@@ -167,8 +189,17 @@ class Partner(Base):
     note: Mapped[str | None] = mapped_column(Text)
     is_active: Mapped[bool] = mapped_column(Boolean, default=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    # ---- bảng kê / thuế GTGT theo yêu cầu từng khách
+    vat_mode: Mapped[str] = mapped_column(String(10), default=VatMode.INCLUDED, server_default=VatMode.INCLUDED)
+    statement_template: Mapped[str] = mapped_column(String(20), default=StatementTemplate.STANDARD,
+                                                    server_default=StatementTemplate.STANDARD)
+    statement_cut_day: Mapped[int | None] = mapped_column(Integer)    # 25 = kỳ từ 26 tháng trước đến 25
+    seller_company_id: Mapped[int | None] = mapped_column(ForeignKey("company_profile.id", ondelete="SET NULL"))
 
     sites: Mapped[list["Site"]] = relationship(back_populates="partner", order_by="Site.sort_order")
+
+    def period_of(self, d) -> str:
+        return period_for(d, self.statement_cut_day)
 
 
 class Site(Base):
@@ -254,6 +285,11 @@ class DeliverySlip(Base):
     other_deduction: Mapped[Decimal] = mapped_column(DecimalType, default=ZERO)   # "trừ tiền đầu tư còn..."
     deduction_note: Mapped[str | None] = mapped_column(String(300))
     total: Mapped[Decimal] = mapped_column(DecimalType, default=ZERO)             # thành tiền phải thu
+    # thuế GTGT: EXCLUDED = giá chưa thuế, tiền chưa thuế/thuế giữ số lẻ như Excel; INCLUDED = tách ngược từ total
+    vat_mode: Mapped[str] = mapped_column(String(10), default=VatMode.INCLUDED, server_default=VatMode.INCLUDED)
+    vat_rate: Mapped[Decimal | None] = mapped_column(DecimalType)
+    amount_before_tax: Mapped[Decimal | None] = mapped_column(DecimalType)
+    vat_amount: Mapped[Decimal | None] = mapped_column(DecimalType)
     cost_total: Mapped[Decimal] = mapped_column(DecimalType, default=ZERO)        # giá vốn
     status: Mapped[str] = mapped_column(String(10), default=DocStatus.POSTED)
     source_type: Mapped[str] = mapped_column(String(10), default=SourceType.MANUAL)
@@ -271,7 +307,8 @@ class DeliverySlip(Base):
 
     @property
     def period(self) -> str:
-        return f"{self.slip_date.year:04d}-{self.slip_date.month:02d}"
+        cut = self.partner.statement_cut_day if self.partner is not None else None
+        return period_for(self.slip_date, cut)
 
     @property
     def sign(self) -> int:

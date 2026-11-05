@@ -20,7 +20,7 @@ from ..models import (
 )
 from ..money import ZERO, D, round_money
 from . import debts
-from .locks import ensure_period_open, period_of
+from .locks import ensure_period_open, partner_period, period_of
 from .sequences import next_number
 
 DEFAULT_CATEGORY = {
@@ -59,7 +59,7 @@ def _fifo_allocate(session: Session, partner_id: int, side: str, amount: Decimal
         result.append((period, take))
         remaining -= take
     if remaining > 0:
-        result.append((period_of(voucher_date), remaining))
+        result.append((partner_period(session, partner_id, voucher_date), remaining))
     return result
 
 
@@ -103,7 +103,7 @@ def _add_voucher(session: Session, *, voucher_type: str, voucher_date: date, amo
             pairs = _fifo_allocate(session, partner.id, side, amount, voucher_date)
         else:
             # hoàn tiền cho khách / NCC hoàn tiền: làm TĂNG lại công nợ của tháng phát sinh phiếu
-            pairs = [(period_of(voucher_date), amount)]
+            pairs = [(partner_period(session, partner.id, voucher_date), amount)]
         for period, amt in pairs:
             _check_period(period)
             voucher.allocations.append(PaymentAllocation(partner_id=partner.id, side=side, period=period,

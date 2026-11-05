@@ -280,6 +280,22 @@ export function AskReason({ title, onOk, onClose }) {
   <//>`;
 }
 
+// Hộp xác nhận (xóa...): nội dung tùy ý, nút đỏ
+export function Confirm({ title, children, okText = "Đồng ý", onOk, onClose, danger = true }) {
+  return html`<${Modal} title=${title} onClose=${onClose}>
+    ${children}
+    <div class="row" style=${{ marginTop: 10 }}>
+      <button class=${danger ? "danger" : "primary"} autoFocus onClick=${onOk}>${okText}</button>
+      <button onClick=${onClose}>Thôi</button></div>
+  <//>`;
+}
+
+export const VAT_MODES = { INCLUDED: "Giá đã gồm thuế GTGT", EXCLUDED: "Giá chưa thuế – cộng thuế GTGT riêng" };
+export const STATEMENT_TEMPLATES = {
+  STANDARD: "Mẫu chung (Stargate) – theo bếp, nợ cũ, thanh toán",
+  VAT_DETAIL: "Mẫu tách thuế GTGT (Welstory) – chưa thuế | thuế | tổng cộng",
+};
+
 export function download(url) {
   const a = document.createElement("a");
   a.href = url; a.download = ""; document.body.appendChild(a); a.click(); a.remove();

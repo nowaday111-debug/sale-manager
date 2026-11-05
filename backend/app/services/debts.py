@@ -26,12 +26,11 @@ from ..models import (
     Purchase,
 )
 from ..money import ZERO, D
-from .locks import period_of
+from .locks import period_of, period_range
 
 
-def _period_start(period: str) -> date:
-    y, m = period.split("-")
-    return date(int(y), int(m), 1)
+def _period_start(period: str, cut_day: int | None = None) -> date:
+    return period_range(period, cut_day)[0]
 
 
 def charges_by_period(session: Session, partner_id: int, side: str, *, as_of: date | None = None,
@@ -57,9 +56,11 @@ def charges_by_period(session: Session, partner_id: int, side: str, *, as_of: da
             out[doc.period] += doc.sign * D(doc.total)
     else:
         raise BusinessError(f"Loại công nợ không hợp lệ: {side}")
+    partner = session.get(Partner, partner_id)
+    cut = partner.statement_cut_day if partner else None
     for ob in session.scalars(select(OpeningBalance).where(OpeningBalance.partner_id == partner_id,
                                                            OpeningBalance.side == side)):
-        start = _period_start(ob.period)
+        start = _period_start(ob.period, cut)
         if as_of and start > as_of:
             continue
         if date_from and start < date_from.replace(day=1):
@@ -158,7 +159,7 @@ def debt_summary(session: Session, side: str, date_from: date, date_to: date) ->
                     decrease += D(d.total)
         for ob in session.scalars(select(OpeningBalance).where(OpeningBalance.partner_id == p.id,
                                                                OpeningBalance.side == side)):
-            start = _period_start(ob.period)
+            start = _period_start(ob.period, p.statement_cut_day)
             if date_from <= start <= date_to:
                 increase += D(ob.amount)
         paid = allocations_by_period(session, p.id, side, as_of=date_to, before=None)
@@ -195,7 +196,8 @@ def debt_detail(session: Session, partner_id: int, side: str, date_from: date, d
                            D(d.total) if d.sign < 0 else ZERO))
     for ob in session.scalars(select(OpeningBalance).where(OpeningBalance.partner_id == partner_id,
                                                            OpeningBalance.side == side)):
-        start = _period_start(ob.period)
+        _p = session.get(Partner, partner_id)
+        start = _period_start(ob.period, _p.statement_cut_day if _p else None)
         if date_from <= start <= date_to:
             events.append((start, -1, f"Số dư chuyển sang tháng {ob.period}", "", D(ob.amount), ZERO))
     for v in session.scalars(select(CashVoucher).where(

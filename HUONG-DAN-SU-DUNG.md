@@ -282,6 +282,27 @@ Khi phần mềm được đưa lên máy chủ thuê (VPS) bằng `docs/DEPLOY-
 
 ---
 
+## 14a. Khách tính thuế GTGT riêng, mẫu bảng kê Welstory, xóa khách / xóa phiếu (cập nhật 05/11/2026)
+
+**Khách yêu cầu tách thuế GTGT (VD Welstory)**
+1. *Cài đặt → Đơn vị bán hàng khác → + Thêm* nếu khách được xuất bảng kê dưới tên công ty khác (VD Cty CP Metro Toàn Cầu).
+2. *Khách hàng → chọn khách → Thông tin → Sửa*, phần **Thuế GTGT & bảng kê**:
+   - Cách tính thuế: **Giá chưa thuế – cộng thuế GTGT riêng**
+   - Mẫu bảng kê: **Mẫu tách thuế GTGT (Welstory)** (tự chọn khi đổi cách tính thuế)
+   - Ngày chốt kỳ: **25** nếu bảng kê tháng 10 tính từ 26/09 đến 25/10 (để trống = theo tháng)
+   - Đơn vị bán hàng in trên bảng kê: chọn đơn vị đã thêm ở bước 1.
+3. *Bảng giá*: nhập **giá CHƯA thuế** (VD 34.682 đ/kg).
+4. Lập phiếu như bình thường: màn hình hiện Tiền chưa thuế, Thuế GTGT 8%, Tổng cộng thanh toán. Có thể đổi cách tính thuế / thuế suất riêng cho từng phiếu.
+5. Bảng kê tháng → Tải Excel: đúng mẫu file Welstory (Ngày | Loại bình | Gas dư | Thực giao | Đơn giá chưa thuế | Thành tiền chưa thuế | Tiền thuế GTGT 8% | Tổng cộng thanh toán | Ghi chú), công thức giữ số lẻ như file gốc.
+   Tổng tiền của kỳ được làm tròn 1 lần nên công nợ trong phần mềm khớp đúng ô "Số tiền bên mua phải thanh toán" trên Excel (thành tiền từng phiếu có thể chênh ±1 đ).
+
+**Xóa khách hàng / nhà cung cấp** – nút *Xóa* ở danh sách hoặc trong Thông tin khách:
+- Chưa có chứng từ → xóa hẳn (kèm bếp, tên gọi khác, bảng giá riêng).
+- Đã có phiếu / thu chi / bảng kê → không xóa được, chỉ **Ngừng theo dõi** (ẩn khỏi danh sách). Tick "Hiện cả đối tác đã ngừng theo dõi" rồi bấm *Theo dõi lại* để bật lại.
+
+**Xóa phiếu** – nút *Xóa* ở Danh sách phiếu: phiếu nháp / đã hủy xóa ngay; phiếu đã ghi sổ được tự hoàn kho, vỏ mượn, công nợ rồi xóa.
+Không xóa được khi kỳ đã khóa sổ (mở khóa bảng kê trước) hoặc phiếu có phiếu thu đi kèm (hủy phiếu thu trước). Muốn giữ dấu vết thì dùng *Hủy* thay vì *Xóa*.
+
 ## 14. Câu hỏi thường gặp & xử lý lỗi
 
 | Hiện tượng | Cách xử lý |

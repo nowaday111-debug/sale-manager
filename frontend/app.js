@@ -2,7 +2,7 @@
 import {
   React, html, useState, useEffect, useRef, useMemo, api, money, num, vnDate, today, thisPeriod, periodBounds,
   prevPeriod, Msg, Badge, NumInput, useLoad, PartnerSelect, AskReason, download, ASSET_TYPES, DIRECTIONS, STATUS,
-  Icon, getIdentity, setIdentity, ROLES,
+  Icon, getIdentity, setIdentity, ROLES, Confirm, Modal, VAT_MODES, STATEMENT_TEMPLATES,
 } from "./lib.js";
 import { OrdersPage, DeliveryPage, ReconciliationPage, FlowTodo } from "./flow.js";
 
@@ -87,8 +87,9 @@ const emptyLine = () => ({ product_id: null, qty: null, unit_price: null, price_
 const emptySlip = () => ({
   partner_id: null, site_id: null, slip_date: today(), slip_no: "", vat_invoice_no: "", staff: "",
   items: [emptyLine()], gas_residual_kg: null, other_deduction: null, deduction_note: "", note: "",
-  assets: [], paid_amount: null, paid_fund: "CASH", doc_type: "SALE",
+  assets: [], paid_amount: null, paid_fund: "CASH", doc_type: "SALE", vat_mode: null, vat_rate: null,
 });
+const pct = (r) => `${Math.round(Number(r) * 10000) / 100}%`;
 
 function lineAmount(line, prod) {
   const q = Number(line.qty || 0), p = Number(line.unit_price || 0);
@@ -116,7 +117,7 @@ function SlipForm({ master, params }) {
         deduction_note: s.deduction_note || "",
         items: s.items.map((i) => ({ product_id: i.product_id, qty: i.qty, unit_price: i.unit_price,
           price_basis: i.price_basis, description: i.description || "" })),
-        assets: s.assets || [], paid_amount: null,
+        assets: s.assets || [], paid_amount: null, vat_mode: s.vat_mode || null, vat_rate: s.vat_rate || null,
       });
     }).catch((e) => setMsg({ type: "err", text: e.message }));
   }, [params.id]);
@@ -146,20 +147,30 @@ function SlipForm({ master, params }) {
   });
   const addLine = () => setSlip((s) => ({ ...s, items: [...s.items, emptyLine()] }));
 
+  const partner = master.partners.find((p) => p.id === slip.partner_id);
+  const vatMode = slip.vat_mode || (partner && partner.vat_mode) || "INCLUDED";
   const calc = useMemo(() => {
-    let gross = 0, kg = 0, resPrice = null;
+    let gross = 0, kg = 0, resPrice = null, rate = null;
     for (const l of slip.items) {
       const p = prodById[l.product_id];
       gross += lineAmount(l, p);
       if (p && p.kind === "GAS_CYLINDER") {
         kg += Number(l.qty || 0) * Number(p.capacity_kg || 0);
+        if (rate === null) rate = Number(p.vat_rate);
         if (resPrice === null && l.unit_price) resPrice = l.price_basis === "KG" ? Number(l.unit_price) : Number(l.unit_price) / Number(p.capacity_kg || 1);
       }
     }
-    const res = Number(slip.gas_residual_kg || 0);
-    const total = Math.round(gross - res * (resPrice || 0) - Number(slip.other_deduction || 0));
-    return { gross, kg, net: kg - res, total };
-  }, [slip, prodById]);
+    if (slip.vat_rate !== null && slip.vat_rate !== undefined && slip.vat_rate !== "") rate = Number(slip.vat_rate) > 1 ? Number(slip.vat_rate) / 100 : Number(slip.vat_rate);
+    if (rate === null || Number.isNaN(rate)) rate = 0.08;
+    const res = Number(slip.gas_residual_kg || 0), ded = Number(slip.other_deduction || 0);
+    let total, before, vat;
+    if (vatMode === "EXCLUDED") {
+      before = gross - res * (resPrice || 0); vat = before * rate; total = before + vat - ded;
+    } else {
+      total = Math.round(gross - res * (resPrice || 0) - ded); before = Math.round(total / (1 + rate)); vat = total - before;
+    }
+    return { gross, kg, net: kg - res, total, before, vat, rate };
+  }, [slip, prodById, vatMode]);
 
   const save = async (status) => {
     setBusy(true); setMsg(null);
@@ -168,6 +179,7 @@ function SlipForm({ master, params }) {
         ...slip, status,
         slip_no: slip.slip_no || null, vat_invoice_no: slip.vat_invoice_no || null, staff: slip.staff || null,
         note: slip.note || null, deduction_note: slip.deduction_note || null,
+        vat_mode: slip.vat_mode || null, vat_rate: slip.vat_rate || null,
         gas_residual_kg: slip.gas_residual_kg || "0", other_deduction: slip.other_deduction || "0",
         paid_amount: slip.paid_amount || "0",
         items: slip.items.filter((l) => l.product_id && l.qty).map((l) => ({
@@ -224,7 +236,7 @@ function SlipForm({ master, params }) {
     </div>
 
     <div class="panel">
-      <table><thead><tr><th style=${{ width: 32 }}>#</th><th>Hàng</th><th>SL</th><th>Tính giá theo</th><th>Đơn giá</th><th>Kg</th><th>Thành tiền</th><th>Ghi chú dòng</th><th></th></tr></thead>
+      <table><thead><tr><th style=${{ width: 32 }}>#</th><th>Hàng</th><th>SL</th><th>Tính giá theo</th><th>${vatMode === "EXCLUDED" ? "Đơn giá chưa thuế" : "Đơn giá (gồm VAT)"}</th><th>Kg</th><th>${vatMode === "EXCLUDED" ? "Tiền chưa thuế" : "Thành tiền"}</th><th>Ghi chú dòng</th><th></th></tr></thead>
       <tbody>${slip.items.map((l, i) => {
         const p = prodById[l.product_id];
         return html`<tr key=${i}><td class="c">${i + 1}</td>
@@ -245,10 +257,19 @@ function SlipForm({ master, params }) {
         <label>Trừ khác (đ) <${NumInput} value=${slip.other_deduction} width=${110} onChange=${(v) => set({ other_deduction: v })} /></label>
         <label class="grow">Lý do trừ <input value=${slip.deduction_note} onInput=${(e) => set({ deduction_note: e.target.value })} /></label>
       </div>
+      <div class="row" style=${{ marginTop: 10 }}>
+        <label>Thuế GTGT <select value=${slip.vat_mode || ""} onChange=${(e) => set({ vat_mode: e.target.value || null })}>
+          <option value="">Theo khách (${VAT_MODES[(partner && partner.vat_mode) || "INCLUDED"]})</option>
+          ${Object.entries(VAT_MODES).map(([k, v]) => html`<option key=${k} value=${k}>${v}</option>`)}</select></label>
+        <label>Thuế suất (%) <${NumInput} value=${slip.vat_rate !== null && slip.vat_rate !== undefined && slip.vat_rate !== "" ? (Number(slip.vat_rate) <= 1 ? Number(slip.vat_rate) * 100 : slip.vat_rate) : null}
+          width=${60} placeholder=${String(Math.round(calc.rate * 10000) / 100)} onChange=${(v) => set({ vat_rate: v === null || v === "" ? null : String(Number(v) / 100) })} /></label>
+      </div>
       <div class="row" style=${{ marginTop: 10, fontSize: 15 }}>
         <span>Tổng kg: <b>${num(calc.kg)}</b></span><span>Thực giao: <b>${num(calc.net)}</b> kg</span>
-        <span class="right">Thành tiền (tạm tính): <b style=${{ fontSize: 18 }}>${money(calc.total)}</b> đ</span>
+        <span>Tiền chưa thuế: <b>${num(calc.before, 2)}</b></span><span>Thuế GTGT ${pct(calc.rate)}: <b>${num(calc.vat, 2)}</b></span>
+        <span class="right">${vatMode === "EXCLUDED" ? "Tổng cộng thanh toán" : "Thành tiền"} (tạm tính): <b style=${{ fontSize: 18 }}>${money(calc.total)}</b> đ</span>
       </div>
+      ${vatMode === "EXCLUDED" && html`<div class="small muted">Khách tính thuế riêng: tiền chưa thuế và tiền thuế giữ số lẻ như file Excel; tổng của cả kỳ được làm tròn một lần (thành tiền từng phiếu có thể chênh ±1 đ để tổng kỳ khớp Excel).</div>`}
     </div>
 
     <div class="panel">
@@ -285,6 +306,7 @@ function SlipList({ master }) {
   const [f, setF] = useState({ partner_id: null, period: thisPeriod(), status: "" });
   const [from, to] = periodBounds(f.period);
   const [ask, setAsk] = useState(null);
+  const [del, setDel] = useState(null);
   const [msg, setMsg] = useState(null);
   const q = new URLSearchParams({ date_from: from, date_to: to, ...(f.partner_id ? { partner_id: f.partner_id } : {}), ...(f.status ? { status: f.status } : {}) });
   const list = useLoad(() => api(`/api/slips?${q}`), [q.toString()]);
@@ -297,22 +319,29 @@ function SlipList({ master }) {
       <label>Trạng thái <select value=${f.status} onChange=${(e) => setF({ ...f, status: e.target.value })}>
         <option value="">Tất cả</option><option value="POSTED">Đã ghi sổ</option><option value="DRAFT">Nháp</option><option value="CANCELLED">Đã hủy</option></select></label>
     </div>
-    <div class="panel"><table><thead><tr><th>Ngày</th><th>Seri</th><th>Số HĐ</th><th>Khách / bếp</th><th>Hàng</th><th>Gas dư</th><th>Thành tiền</th><th>Trạng thái</th><th></th></tr></thead>
+    <div class="panel"><table><thead><tr><th>Ngày</th><th>Seri</th><th>Số HĐ</th><th>Khách / bếp</th><th>Hàng</th><th>Gas dư</th><th>Thuế GTGT</th><th>Thành tiền</th><th>Trạng thái</th><th></th></tr></thead>
       <tbody>${rows.map((s) => html`<tr key=${s.id}>
         <td>${vnDate(s.slip_date)}</td><td>${s.slip_no}</td><td>${s.vat_invoice_no}</td>
         <td>${s.partner_name}<div class="small muted">${s.site_name}</div></td>
         <td>${s.items.map((i) => `${num(i.qty)} ${i.sku}`).join(", ")}</td><td class="r">${num(s.gas_residual_kg)}</td>
+        <td class="r small">${s.vat_amount !== null && s.vat_amount !== undefined ? html`${money(s.vat_amount)}${s.vat_mode === "EXCLUDED" ? html`<div class="muted">tách riêng</div>` : ""}` : ""}</td>
         <td class="r">${s.doc_type === "RETURN_SALE" ? "−" : ""}${money(s.total)}</td><td><${Badge} s=${s.status} /></td>
         <td style=${{ whiteSpace: "nowrap" }}>
           ${s.status !== "CANCELLED" && html`<button class="link" onClick=${() => go("slip", { id: s.id })}>Sửa</button>`}
           ${s.status === "DRAFT" && html`<button class="link" onClick=${() => act(() => api(`/api/slips/${s.id}/approve`, { method: "POST" }))}>Duyệt</button>`}
           ${s.status !== "CANCELLED" && html`<button class="link danger" onClick=${() => setAsk(s)}>Hủy</button>`}
+          <button class="link danger" onClick=${() => setDel(s)}>Xóa</button>
           ${s.image_path && html`<a class="small" href=${`/api/ocr/jobs/${(JSON.parse(s.ocr_json || "{}") || {}).ocr_job_id}/image`} target="_blank">Ảnh</a>`}
         </td></tr>`)}
-      <tr class="total"><td colspan="6">${rows.length} phiếu</td><td class="r">${money(rows.filter((s) => s.status === "POSTED").reduce((a, s) => a + (s.doc_type === "RETURN_SALE" ? -1 : 1) * Number(s.total), 0))}</td><td colspan="2"></td></tr>
+      <tr class="total"><td colspan="7">${rows.length} phiếu</td><td class="r">${money(rows.filter((s) => s.status === "POSTED").reduce((a, s) => a + (s.doc_type === "RETURN_SALE" ? -1 : 1) * Number(s.total), 0))}</td><td colspan="2"></td></tr>
       </tbody></table></div>
     ${ask && html`<${AskReason} title=${`Hủy phiếu #${ask.id}`} onClose=${() => setAsk(null)}
       onOk=${(reason) => { const id = ask.id; setAsk(null); act(() => api(`/api/slips/${id}/cancel`, { json: { reason } })); }} />`}
+    ${del && html`<${Confirm} title=${`Xóa phiếu ${del.slip_no ? "seri " + del.slip_no : "#" + del.id}?`} okText="Xóa phiếu" onClose=${() => setDel(null)}
+      onOk=${() => { const id = del.id; setDel(null); act(async () => { await api(`/api/slips/${id}`, { method: "DELETE" }); setMsg({ type: "ok", text: `Đã xóa phiếu #${id}` }); }); }}>
+      <p>${del.partner_name} · ${vnDate(del.slip_date)} · ${money(del.total)} đ</p>
+      ${del.status === "POSTED" ? html`<p class="msg warn">Phiếu đã ghi sổ: phần mềm sẽ tự hoàn lại kho, vỏ mượn / thiết bị kèm phiếu và giảm công nợ của khách rồi xóa hẳn phiếu. Không khôi phục được (trừ bản sao lưu).</p>`
+        : html`<p>Phiếu ${STATUS[del.status]} sẽ bị xóa hẳn.</p>`}<//>`}
   </div>`;
 }
 
@@ -436,30 +465,77 @@ function OcrReview({ id, master, onDone, onBack }) {
 function Customers({ master, params }) {
   const [q, setQ] = useState("");
   const [adding, setAdding] = useState(false);
+  const [showOff, setShowOff] = useState(false);
+  const [kind, setKind] = useState("");
+  const [del, setDel] = useState(null);
+  const [msg, setMsg] = useState(null);
   const id = params.id ? Number(params.id) : null;
+  const all = useLoad(() => (showOff ? api("/api/partners?include_inactive=true") : Promise.resolve(null)), [showOff, msg]);
   if (id) return html`<${CustomerDetail} id=${id} master=${master} />`;
-  const list = (master.allPartners || []).filter((p) => !q || `${p.code} ${p.name} ${p.tax_code || ""}`.toLowerCase().includes(q.toLowerCase()));
-  return html`<div><h2>Khách hàng & nhà cung cấp</h2>
+  const source = (showOff && all.data) || master.allPartners || [];
+  const list = source.filter((p) => (!q || `${p.code} ${p.name} ${p.tax_code || ""}`.toLowerCase().includes(q.toLowerCase()))
+    && (!kind || p.partner_type === kind || p.partner_type === "BOTH"));
+  const reactivate = async (p) => {
+    try { await api(`/api/partners/${p.id}`, { method: "PATCH", json: { is_active: true } }); master.reload(); setMsg({ type: "ok", text: `Đã theo dõi lại ${p.name}` }); }
+    catch (e) { setMsg({ type: "err", text: e.message }); }
+  };
+  return html`<div><h2>Khách hàng & nhà cung cấp</h2><${Msg} msg=${msg} />
     <div class="panel row"><input class="grow" placeholder="Tìm theo mã, tên, MST…" value=${q} onInput=${(e) => setQ(e.target.value)} />
+      <label>Loại <select value=${kind} onChange=${(e) => setKind(e.target.value)}><option value="">Tất cả</option>
+        <option value="CUSTOMER">Khách hàng</option><option value="SUPPLIER">Nhà cung cấp</option></select></label>
+      <label class="small chk"><input type="checkbox" checked=${showOff} onChange=${(e) => setShowOff(e.target.checked)} /> Hiện cả đối tác đã ngừng theo dõi</label>
       <button class="primary" onClick=${() => setAdding(true)}>+ Thêm</button></div>
     ${adding && html`<${PartnerForm} onDone=${() => { setAdding(false); master.reload(); }} />`}
-    <div class="panel"><table><thead><tr><th>Mã</th><th>Tên</th><th>MST</th><th>Điện thoại</th><th>Loại</th></tr></thead>
+    <div class="panel"><table><thead><tr><th>Mã</th><th>Tên</th><th>MST</th><th>Điện thoại</th><th>Loại</th><th>Thuế / mẫu bảng kê</th><th></th></tr></thead>
       <tbody>${list.map((p) => html`<tr key=${p.id} class="click" onClick=${() => go("customers", { id: p.id })}>
-        <td>${p.code}</td><td>${p.name}</td><td>${p.tax_code}</td><td>${p.phone}</td><td>${{ CUSTOMER: "Khách", SUPPLIER: "NCC", BOTH: "Cả hai" }[p.partner_type]}</td></tr>`)}</tbody></table></div>
+        <td>${p.code}</td><td>${p.name}${p.is_active ? "" : html` <span class="badge CANCELLED">ngừng theo dõi</span>`}</td><td>${p.tax_code}</td><td>${p.phone}</td>
+        <td>${{ CUSTOMER: "Khách", SUPPLIER: "NCC", BOTH: "Cả hai" }[p.partner_type]}</td>
+        <td class="small">${p.partner_type !== "SUPPLIER" ? `${p.vat_mode === "EXCLUDED" ? "Tách thuế GTGT" : "Giá gồm VAT"}${p.statement_cut_day ? ` · chốt ngày ${p.statement_cut_day}` : ""}` : ""}</td>
+        <td style=${{ whiteSpace: "nowrap" }} onClick=${(e) => e.stopPropagation()}>
+          ${p.is_active ? html`<button class="link danger" onClick=${() => setDel(p)}>Xóa</button>`
+            : html`<button class="link" onClick=${() => reactivate(p)}>Theo dõi lại</button>`}</td></tr>`)}</tbody></table></div>
+    ${del && html`<${DeletePartner} partner=${del} onClose=${() => setDel(null)} onDone=${(text) => { setDel(null); master.reload(); setMsg({ type: "ok", text }); }} />`}
   </div>`;
+}
+
+// Xóa khách hàng / NCC: chưa có chứng từ thì xóa hẳn, đã có thì chỉ cho "Ngừng theo dõi"
+function DeletePartner({ partner, onClose, onDone }) {
+  const usage = useLoad(() => api(`/api/partners/${partner.id}/usage`), [partner.id]);
+  const [err, setErr] = useState(null);
+  const u = usage.data;
+  const run = async (deactivate) => {
+    try {
+      const r = await api(`/api/partners/${partner.id}${deactivate ? "?deactivate_if_used=true" : ""}`, { method: "DELETE" });
+      onDone(r.deleted ? `Đã xóa ${partner.name}` : `Đã ngừng theo dõi ${partner.name} (ẩn khỏi danh sách, bật lại được)`);
+    } catch (e) { setErr(e.message); }
+  };
+  const label = partner.partner_type === "SUPPLIER" ? "nhà cung cấp" : "khách hàng";
+  return html`<${Modal} title=${`Xóa ${label} ${partner.code} – ${partner.name}?`} onClose=${onClose}>
+    <${Msg} msg=${err && { type: "err", text: err }} />
+    ${!u ? html`<p class="muted">Đang kiểm tra chứng từ…</p>` : u.can_delete
+      ? html`<p>Chưa có chứng từ nào. Xóa hẳn ${label} này cùng các bếp, tên gọi khác và bảng giá riêng?</p>
+        <div class="row"><button class="danger" onClick=${() => run(false)}>Xóa hẳn</button><button onClick=${onClose}>Thôi</button></div>`
+      : html`<p>${label[0].toUpperCase() + label.slice(1)} đã có: <b>${Object.entries(u.usage).map(([k, n]) => `${n} ${k}`).join(", ")}</b>.</p>
+        <div class="msg warn"><span>Không xóa được vì sẽ làm sai công nợ, kho và bảng kê đã lập. Có thể <b>Ngừng theo dõi</b>: ẩn khỏi các danh sách chọn; số liệu cũ vẫn giữ nguyên và bật lại được bất cứ lúc nào.</span></div>
+        <div class="row"><button class="danger" onClick=${() => run(true)}>Ngừng theo dõi</button><button onClick=${onClose}>Thôi</button></div>`}
+  <//>`;
 }
 
 function PartnerForm({ partner, onDone }) {
   const [f, setF] = useState(partner || { code: "", name: "", partner_type: "CUSTOMER", tax_code: "", address: "", phone: "", contact_name: "", workbook_path: "", credit_limit: null,
-    payment_term_days: 30, email: "", representative: "", representative_title: "" });
+    payment_term_days: 30, email: "", representative: "", representative_title: "", vat_mode: "INCLUDED", statement_template: "STANDARD",
+    statement_cut_day: null, seller_company_id: null });
   const [err, setErr] = useState(null);
+  const companies = useLoad(() => api("/api/companies"), []);
   const field = (k, label, w) => html`<label class=${w ? "" : "grow"}>${label}<input value=${f[k] || ""} style=${w ? { width: w } : {}} onInput=${(e) => setF({ ...f, [k]: e.target.value })} /></label>`;
   const save = async () => {
     try {
       const body = { code: f.code, name: f.name, partner_type: f.partner_type, tax_code: f.tax_code || null, address: f.address || null,
         phone: f.phone || null, contact_name: f.contact_name || null, workbook_path: f.workbook_path || null, credit_limit: f.credit_limit || null,
         payment_term_days: Number(f.payment_term_days || 0), email: f.email || null, representative: f.representative || null,
-        representative_title: f.representative_title || null };
+        representative_title: f.representative_title || null, vat_mode: f.vat_mode || "INCLUDED",
+        statement_template: f.statement_template || "STANDARD", statement_cut_day: Number(f.statement_cut_day || 0),
+        seller_company_id: f.seller_company_id || null };
       if (partner) await api(`/api/partners/${partner.id}`, { method: "PATCH", json: body }); else await api("/api/partners", { json: body });
       onDone();
     } catch (e) { setErr(e.message); }
@@ -474,6 +550,23 @@ function PartnerForm({ partner, onDone }) {
       <label>Số ngày được nợ<${NumInput} value=${f.payment_term_days} width=${90} onChange=${(v) => setF({ ...f, payment_term_days: v })} /></label></div>
     <div class="row" style=${{ marginTop: 8 }}>${field("email", "Email", 200)}${field("representative", "Người đại diện (ký BB đối chiếu)")}${field("representative_title", "Chức vụ", 160)}</div>
     <div class="row" style=${{ marginTop: 8 }}>${field("workbook_path", "File Excel bảng kê của khách (đường dẫn đầy đủ, VD: D:\\BangKe\\Stargate.xlsx)")}</div>
+    ${f.partner_type !== "SUPPLIER" && html`<fieldset style=${{ marginTop: 10 }}><legend class="small muted">Thuế GTGT & bảng kê (theo yêu cầu của khách)</legend>
+      <div class="row">
+        <label>Cách tính thuế GTGT <select value=${f.vat_mode || "INCLUDED"} onChange=${(e) => setF({ ...f, vat_mode: e.target.value,
+          statement_template: e.target.value === "EXCLUDED" ? "VAT_DETAIL" : (f.statement_template === "VAT_DETAIL" ? "STANDARD" : f.statement_template) })}>
+          ${Object.entries(VAT_MODES).map(([k, v]) => html`<option key=${k} value=${k}>${v}</option>`)}</select></label>
+        <label class="grow">Mẫu bảng kê <select value=${f.statement_template || "STANDARD"} onChange=${(e) => setF({ ...f, statement_template: e.target.value })}>
+          ${Object.entries(STATEMENT_TEMPLATES).map(([k, v]) => html`<option key=${k} value=${k}>${v}</option>`)}</select></label>
+      </div>
+      <div class="row" style=${{ marginTop: 8 }}>
+        <label>Ngày chốt kỳ (để trống = hết tháng)<${NumInput} value=${f.statement_cut_day} width=${80} placeholder="VD 25" onChange=${(v) => setF({ ...f, statement_cut_day: v })} /></label>
+        <label class="grow">Đơn vị bán hàng in trên bảng kê <select value=${f.seller_company_id || ""} onChange=${(e) => setF({ ...f, seller_company_id: Number(e.target.value) || null })}>
+          <option value="">— Công ty chính —</option>
+          ${(companies.data || []).slice(1).map((c) => html`<option key=${c.id} value=${c.id}>${c.short_name || c.name}</option>`)}</select></label>
+      </div>
+      <div class="small muted" style=${{ marginTop: 4 }}>Ngày chốt 25: bảng kê tháng 10 tính từ 26/09 đến 25/10. Giá chưa thuế: nhập bảng giá CHƯA thuế, bảng kê có cột Thành tiền chưa thuế – Tiền thuế GTGT – Tổng cộng thanh toán.
+        Thêm đơn vị bán hàng khác (VD Cty CP Metro Toàn Cầu) ở Cài đặt.</div>
+    </fieldset>`}
     <div class="row" style=${{ marginTop: 10 }}><button class="primary" onClick=${save}>Lưu</button><button onClick=${() => onDone()}>Thôi</button></div></div>`;
 }
 
@@ -482,6 +575,7 @@ function CustomerDetail({ id, master }) {
   const ov = useLoad(() => api(`/api/reports/customers/${id}/overview?period=${period}&months=12`), [id, period]);
   const partner = useLoad(() => api(`/api/partners/${id}`), [id]);
   const [edit, setEdit] = useState(false);
+  const [del, setDel] = useState(false);
   const [tab, setTab] = useState("overview");
   const d = ov.data;
   const maxAmt = d ? Math.max(1, ...d.monthly.map((m) => Number(m.amount))) : 1;
@@ -521,8 +615,14 @@ function CustomerDetail({ id, master }) {
       : html`<div class="panel"><table><tbody>${[["Mã", "code"], ["Tên", "name"], ["MST", "tax_code"], ["Địa chỉ", "address"], ["Liên hệ", "contact_name"], ["Điện thoại", "phone"], ["Email", "email"],
         ["Người đại diện", "representative"], ["Chức vụ", "representative_title"], ["Hạn mức nợ", "credit_limit"], ["Số ngày được nợ", "payment_term_days"],
         ["Dư nợ sổ cái đơn hàng", "current_debt"], ["Phải trả NCC (sổ cái)", "current_payable"], ["File bảng kê", "workbook_path"]].map(([l, k]) =>
-        html`<tr key=${k}><th style=${{ width: 160, textAlign: "left" }}>${l}</th><td>${partner.data[k]}</td></tr>`)}</tbody></table>
-        <button style=${{ marginTop: 10 }} onClick=${() => setEdit(true)}>Sửa</button></div>`)}
+        html`<tr key=${k}><th style=${{ width: 160, textAlign: "left" }}>${l}</th><td>${partner.data[k]}</td></tr>`)}
+        <tr><th style=${{ textAlign: "left" }}>Thuế GTGT</th><td>${VAT_MODES[partner.data.vat_mode || "INCLUDED"]}</td></tr>
+        <tr><th style=${{ textAlign: "left" }}>Mẫu bảng kê</th><td>${STATEMENT_TEMPLATES[partner.data.statement_template || "STANDARD"]}</td></tr>
+        <tr><th style=${{ textAlign: "left" }}>Kỳ bảng kê</th><td>${partner.data.statement_cut_day ? `Chốt ngày ${partner.data.statement_cut_day} (từ ngày ${partner.data.statement_cut_day + 1} tháng trước)` : "Theo tháng (01 → cuối tháng)"}</td></tr>
+        </tbody></table>
+        <div class="row" style=${{ marginTop: 10 }}><button onClick=${() => setEdit(true)}>Sửa</button>
+          <button class="danger" onClick=${() => setDel(true)}>Xóa…</button></div></div>`)}
+    ${del && partner.data && html`<${DeletePartner} partner=${partner.data} onClose=${() => setDel(false)} onDone=${() => { setDel(false); master.reload(); go("customers"); }} />`}
   </div>`;
 }
 
@@ -554,6 +654,8 @@ function SitesTab({ partnerId }) {
 }
 
 function PricesTab({ partnerId, master }) {
+  const partner = useLoad(() => api(`/api/partners/${partnerId}`), [partnerId]);
+  const excluded = partner.data && partner.data.vat_mode === "EXCLUDED";
   const [f, setF] = useState({ product_id: null, price: null, valid_from: today(), price_basis: "KG" });
   const [msg, setMsg] = useState(null);
   const [cur, setCur] = useState({});
@@ -563,16 +665,16 @@ function PricesTab({ partnerId, master }) {
       .then((rows) => setCur(Object.fromEntries(rows)));
   }, [partnerId, master.products, msg]);
   const save = async () => {
-    try { await api("/api/prices", { json: { ...f, partner_id: partnerId } }); setMsg({ type: "ok", text: "Đã lưu giá" }); }
+    try { await api("/api/prices", { json: { ...f, partner_id: partnerId, vat_included: !excluded } }); setMsg({ type: "ok", text: "Đã lưu giá" }); }
     catch (e) { setMsg({ type: "err", text: e.message }); }
   };
   return html`<div><${Msg} msg=${msg} />
-    <div class="panel"><table><thead><tr><th>Mặt hàng</th><th>Giá đang áp dụng hôm nay</th></tr></thead><tbody>
+    <div class="panel"><table><thead><tr><th>Mặt hàng</th><th>Giá đang áp dụng hôm nay ${excluded ? "(chưa thuế GTGT)" : "(đã gồm VAT)"}</th></tr></thead><tbody>
       ${gas.map((p) => html`<tr key=${p.id}><td>${p.sku} – ${p.name}</td><td class="r">${cur[p.id] ? `${money(cur[p.id].price)} đ/${cur[p.id].price_basis === "KG" ? "kg" : "bình"}` : html`<span class="muted">chưa có</span>`}</td></tr>`)}</tbody></table></div>
     <div class="panel row">
       <label>Mặt hàng <select value=${f.product_id || ""} onChange=${(e) => setF({ ...f, product_id: Number(e.target.value) || null })}><option value="">—</option>
         ${gas.map((p) => html`<option key=${p.id} value=${p.id}>${p.sku}</option>`)}</select></label>
-      <label>Giá (gồm VAT) <${NumInput} value=${f.price} onChange=${(v) => setF({ ...f, price: v })} /></label>
+      <label>${excluded ? "Giá CHƯA thuế" : "Giá (gồm VAT)"} <${NumInput} value=${f.price} onChange=${(v) => setF({ ...f, price: v })} /></label>
       <label>Theo <select value=${f.price_basis} onChange=${(e) => setF({ ...f, price_basis: e.target.value })}><option value="KG">kg</option><option value="UNIT">bình/cái</option></select></label>
       <label>Áp dụng từ <input type="date" value=${f.valid_from} onInput=${(e) => setF({ ...f, valid_from: e.target.value })} /></label>
       <button class="primary" disabled=${!f.product_id || !f.price} onClick=${save}>Lưu giá</button></div></div>`;
@@ -599,6 +701,8 @@ function StatementPage({ master, params }) {
       <label>Tháng <input type="month" value=${period} onInput=${(e) => e.target.value && setPeriod(e.target.value)} /></label>
       ${cur && html`<span>Đã lưu: <${Badge} s=${cur.status} /></span>`}
     </div>
+    ${st.data && html`<div class="small muted" style=${{ margin: "-6px 0 10px" }}>${st.data.period_text} · ${STATEMENT_TEMPLATES[st.data.template] || ""}
+      · Đơn vị bán: ${st.data.seller.name}${st.data.cut_day ? ` · khách chốt kỳ ngày ${st.data.cut_day}` : ""}</div>`}
     ${partnerId && html`<div class="panel">
       <div class="row">
         <button class="primary" onClick=${() => download(`/api/statements/export/${partnerId}/${period}`)}>Tải file Excel</button>
@@ -613,7 +717,7 @@ function StatementPage({ master, params }) {
         ${cur && cur.status === "CONFIRMED" && html`<button class="danger" onClick=${() => run(async () => { await api(`/api/statements/${cur.id}/status`, { json: { status: "SENT" } }); return { type: "warn", text: "Đã mở khóa kỳ" }; })}>Mở khóa</button>`}
       </div></div>`}
     ${st.error && html`<${Msg} msg=${{ type: "err", text: st.error }} />`}
-    ${d && html`<${StatementView} d=${d} />`}
+    ${d && (d.template === "VAT_DETAIL" ? html`<${VatStatementView} d=${d} />` : html`<${StatementView} d=${d} />`)}
   </div>`;
 }
 
@@ -656,6 +760,48 @@ function StatementView({ d }) {
     </tbody></table>
     <p><b>Bằng chữ:</b> ${d.amount_in_words}</p>
     ${!d.balanced && html`<div class="msg warn">Lưu ý: số còn nợ trên bảng kê (${money(d.closing_debt)}) khác sổ công nợ (${money(d.ledger_balance)}) – kiểm tra tiền trả trước/sau kỳ.</div>`}
+  </div>`;
+}
+
+// Xem trước mẫu tách thuế GTGT (Welstory)
+function VatStatementView({ d }) {
+  const cols = d.cylinder_columns.length ? d.cylinder_columns : ["PC45"];
+  const rows = d.blocks.flatMap((b) => b.rows.map((r) => ({ ...r, site: b.site_name })))
+    .sort((a, b) => (a.date < b.date ? -1 : a.date > b.date ? 1 : (a.kind === "slip" ? 0 : 1) - (b.kind === "slip" ? 0 : 1)));
+  const multiSite = d.blocks.filter((b) => b.rows.some((r) => r.kind === "slip")).length > 1;
+  const rate = d.vat_rates && d.vat_rates.length ? d.vat_rates[0] : 0.08;
+  const g = d.grand_total;
+  const span = 1 + cols.length + 3;
+  const d2 = (v) => (v === null || v === undefined ? "" : num(v, 3));
+  return html`<div class="panel bk" style=${{ overflowX: "auto" }}>
+    <div><b>${d.seller.name}</b></div>
+    <div style=${{ textAlign: "center", fontSize: 18, fontWeight: 700 }}>BẢNG KÊ CHI TIẾT</div>
+    <div style=${{ textAlign: "center", fontStyle: "italic", fontWeight: 700, marginBottom: 8 }}>${d.period_text}</div>
+    <div>Đơn vị bán hàng: <b>${d.seller.name}</b> · MST ${d.seller.tax_code || ""}</div>
+    <div>Đơn vị mua hàng: <b>${d.buyer.name}</b></div><div class="small">MST ${d.buyer.tax_code || ""} · ${d.buyer.address || ""}</div>
+    <table style=${{ marginTop: 8 }}><thead>
+      <tr><th rowspan="2">Ngày tháng</th><th colspan=${cols.length}>Loại bình</th><th rowspan="2">Gas dư</th><th rowspan="2">Thực giao</th>
+        <th rowspan="2">Đơn giá chưa thuế</th><th rowspan="2">Thành tiền chưa thuế</th><th rowspan="2">Tiền thuế GTGT ${Math.round(Number(rate) * 10000) / 100}%</th>
+        <th rowspan="2">Tổng cộng thanh toán</th><th rowspan="2">Ghi chú</th></tr>
+      <tr>${cols.map((c) => html`<th key=${c}>${c}</th>`)}</tr></thead>
+    <tbody>
+      <tr><td colspan=${span + 4}></td><td class="c"><b>${d.opening_loans_text}</b></td></tr>
+      ${rows.map((r, i) => r.kind === "slip" ? html`<tr key=${i}><td>${vnDate(r.date)}</td>
+        ${cols.map((c) => html`<td key=${c} class="c">${num(r.qty_by_sku[c])}</td>`)}
+        <td class="c">${num(r.gas_residual_kg)}</td><td class="c">${num(r.net_kg)}</td><td class="r">${money(r.unit_price)}</td>
+        <td class="r">${d2(r.amount_before_tax)}</td><td class="r">${d2(r.vat_amount)}</td>
+        <td class="r">${r.vat_mode === "EXCLUDED" ? d2(Number(r.amount_before_tax) + Number(r.vat_amount) - Number(r.other_deduction || 0)) : money(r.amount)}</td>
+        <td class="c">${[multiSite ? r.site : null, r.note, r.description].filter(Boolean).join("; ")}</td></tr>`
+        : html`<tr key=${i}><td>${vnDate(r.date)}</td><td colspan=${span + 3}></td><td class="c">${r.text}</td></tr>`)}
+      <tr class="total"><td>Tổng</td>${cols.map((c) => html`<td key=${c} class="c">${num(g.qty_by_sku[c] || 0)}</td>`)}
+        <td class="c">${num(g.gas_residual_kg)}</td><td class="c">${num(g.net_kg)}</td><td class="c">X</td>
+        <td class="r">${d2(g.amount_before_tax)}</td><td class="r">${d2(g.vat_amount)}</td><td class="r">${d2(Number(g.amount_before_tax || 0) + Number(g.vat_amount || 0))}</td>
+        <td class="c">${d.closing_loans_text}</td></tr>
+    </tbody></table>
+    <p><b>Bằng chữ:</b> ${d.period_words}</p>
+    <p>- Số tiền bên mua phải thanh toán: <b>${money(g.amount)}</b> đồng</p>
+    ${(d.prior_debts.length > 0 || d.payments.length > 0) && html`<div class="msg warn small">Mẫu này chỉ in tiền hàng trong kỳ. Công nợ chung của khách:
+      nợ trước kỳ ${money(d.total_debt - g.amount)} đ, đã thanh toán trong kỳ ${money(d.total_paid)} đ, còn phải trả ${money(d.closing_debt)} đ.</div>`}
   </div>`;
 }
 
@@ -815,6 +961,7 @@ function SettingsPage() {
       ${f && fields.map(([k, l]) => html`<label key=${k} class="row" style=${{ marginBottom: 6 }}><span style=${{ width: 260 }} class="small muted">${l}</span>
         <input class="grow" value=${f[k] || ""} onInput=${(e) => setF({ ...f, [k]: e.target.value })} /></label>`)}
       <button class="primary" onClick=${save}>Lưu</button></div>
+    <${SellerCompanies} />
     <div class="panel"><h3 style=${{ marginTop: 0 }}>Sao lưu dữ liệu</h3>
       <p class="small muted">Phần mềm tự sao lưu mỗi ngày vào thư mục data/backups (giữ 30 bản). Nên chép thêm thư mục này sang USB / Google Drive hằng tuần.</p>
       <button onClick=${async () => { try { const r = await api("/api/backup", { method: "POST" }); setMsg({ type: "ok", text: "Đã sao lưu: " + r.path }); } catch (e) { setMsg({ type: "err", text: e.message }); } }}>Sao lưu ngay</button></div>
@@ -823,6 +970,38 @@ function SettingsPage() {
         ${Object.entries(prov.data.all).map(([k, v]) => html`<tr key=${k}><td>${k}</td><td>${v.default_model}</td><td><code>${v.key_env}</code></td>
           <td>${prov.data.configured.includes(k) ? html`<span class="badge POSTED">đã có khóa</span>` : html`<span class="muted">chưa có</span>`}</td></tr>`)}</tbody></table>`}
       <p class="small muted">Đổi hãng mặc định: thêm dòng <code>OCR_PROVIDER=deepseek</code> (hoặc gemini, qwen, openai, anthropic) vào file backend/.env rồi khởi động lại.</p></div></div>`;
+}
+
+// Các đơn vị bán hàng khác (VD Cty CP Metro Toàn Cầu bán cho Welstory) – chọn ở thông tin từng khách
+function SellerCompanies() {
+  const list = useLoad(() => api("/api/companies"), []);
+  const [f, setF] = useState(null);
+  const [del, setDel] = useState(null);
+  const [msg, setMsg] = useState(null);
+  const keys = [["short_name", "Tên ngắn để chọn (VD: Metro Toàn Cầu)"], ["name", "Tên đơn vị (in trên bảng kê)"], ["tax_code", "MST"], ["address", "Địa chỉ"],
+    ["phones", "Điện thoại"], ["bank_account", "Số tài khoản"], ["bank_name", "Ngân hàng"], ["contact_line", "Người liên hệ (VD: anh Khánh: 0968.97.2011)"], ["sign_city", "Nơi ký"]];
+  const others = (list.data || []).slice(1);
+  const save = async () => {
+    try {
+      const body = Object.fromEntries(keys.map(([k]) => [k, f[k] || (k === "sign_city" ? "Hà Nội" : k === "name" ? "" : null)]));
+      body.parent_name = f.parent_name || null; body.email = f.email || null;
+      if (f.id) await api(`/api/companies/${f.id}`, { method: "PUT", json: body }); else await api("/api/companies", { json: body });
+      setF(null); list.reload(); setMsg({ type: "ok", text: "Đã lưu đơn vị bán hàng" });
+    } catch (e) { setMsg({ type: "err", text: e.message }); }
+  };
+  return html`<div class="panel"><h3 style=${{ marginTop: 0 }}>Đơn vị bán hàng khác</h3><${Msg} msg=${msg} />
+    <p class="small muted">Dùng khi một số khách được xuất bảng kê dưới tên công ty khác. Vào Khách hàng → Thông tin → Sửa → "Đơn vị bán hàng in trên bảng kê" để chọn.</p>
+    ${others.length > 0 && html`<table><thead><tr><th>Tên ngắn</th><th>Tên đơn vị</th><th>MST</th><th></th></tr></thead><tbody>
+      ${others.map((c) => html`<tr key=${c.id}><td>${c.short_name}</td><td>${c.name}</td><td>${c.tax_code}</td>
+        <td style=${{ whiteSpace: "nowrap" }}><button class="link" onClick=${() => setF(c)}>Sửa</button><button class="link danger" onClick=${() => setDel(c)}>Xóa</button></td></tr>`)}</tbody></table>`}
+    ${f ? html`<div style=${{ marginTop: 10 }}>${keys.map(([k, l]) => html`<label key=${k} class="row" style=${{ marginBottom: 6 }}><span style=${{ width: 260 }} class="small muted">${l}</span>
+        <input class="grow" value=${f[k] || ""} onInput=${(e) => setF({ ...f, [k]: e.target.value })} /></label>`)}
+      <div class="row"><button class="primary" disabled=${!f.name} onClick=${save}>Lưu</button><button onClick=${() => setF(null)}>Thôi</button></div></div>`
+      : html`<button style=${{ marginTop: 8 }} onClick=${() => setF({ sign_city: "Hà Nội" })}>+ Thêm đơn vị bán hàng</button>`}
+    ${del && html`<${Confirm} title=${`Xóa đơn vị ${del.short_name || del.name}?`} okText="Xóa" onClose=${() => setDel(null)}
+      onOk=${async () => { const c = del; setDel(null); try { await api(`/api/companies/${c.id}`, { method: "DELETE" }); list.reload(); setMsg({ type: "ok", text: "Đã xóa" }); } catch (e) { setMsg({ type: "err", text: e.message }); } }}>
+      <p>Các khách đang dùng đơn vị này sẽ quay về in tên công ty chính.</p><//>`}
+  </div>`;
 }
 
 // ============================================================ Khung

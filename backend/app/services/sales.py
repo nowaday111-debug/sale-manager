@@ -30,12 +30,14 @@ from ..models import (
     ProductKind,
     SlipType,
     SourceType,
+    VatInvoiceSlip,
+    VatMode,
     VoucherType,
 )
 from ..money import ZERO, D, round_money
 from . import assets as asset_svc
 from . import cashbook, debts, inventory, masterdata
-from .locks import ensure_period_open
+from .locks import ensure_period_open, period_range
 
 REF_TYPE = "SLIP"
 
@@ -87,6 +89,8 @@ class SlipInput:
     paid_amount: object = 0                  # khách trả ngay -> tự sinh phiếu thu
     paid_fund: str = FundType.CASH
     skip_inventory: bool = False             # nhập lịch sử từ Excel: không trừ kho (tồn kho khai báo bằng kiểm kê)
+    vat_mode: str | None = None              # None -> theo khai báo của khách (INCLUDED/EXCLUDED)
+    vat_rate: object | None = None           # None -> thuế suất của mặt hàng gas đầu tiên (8%)
 
 
 @dataclass
@@ -154,8 +158,17 @@ def _build_items(session: Session, data: SlipInput) -> tuple[list[DeliveryItem],
     return rows, raw_total, default_residual
 
 
+_EXACT_Q = Decimal("0.0001")
+
+
+def _exact(v) -> Decimal:
+    """Giữ số lẻ như Excel (tối đa 4 chữ số thập phân để SQLite / PostgreSQL lưu giống nhau)."""
+    return D(v).quantize(_EXACT_Q)
+
+
 def _apply_amounts(slip: DeliverySlip, rows: list[DeliveryItem], raw_total: Decimal, default_residual: Decimal,
-                   data: SlipInput) -> None:
+                   data: SlipInput, *, vat_mode: str = VatMode.INCLUDED,
+                   vat_rate: Decimal = Decimal("0.08")) -> None:
     residual_kg = D(data.gas_residual_kg)
     if residual_kg < 0:
         raise BusinessError("Gas dư không được âm")
@@ -169,11 +182,58 @@ def _apply_amounts(slip: DeliverySlip, rows: list[DeliveryItem], raw_total: Deci
     slip.residual_price = residual_price
     slip.residual_amount = round_money(raw_residual)
     slip.other_deduction = round_money(deduction)
-    # Làm tròn một lần ở cuối, giống Excel: (số bình × kg − gas dư) × đơn giá
-    slip.total = round_money(raw_total - raw_residual - deduction)
+    slip.vat_mode = vat_mode
+    slip.vat_rate = vat_rate
+    if vat_mode == VatMode.EXCLUDED:
+        # Đơn giá CHƯA thuế: tiền chưa thuế = thực giao × đơn giá; thuế = tiền chưa thuế × thuế suất (giữ số lẻ
+        # như file Excel mẫu Welstory). Thành tiền phiếu được làm tròn lũy kế trong kỳ – xem rebalance_vat_period.
+        before = _exact(raw_total - raw_residual)
+        vat = _exact(before * vat_rate)
+        slip.amount_before_tax = before
+        slip.vat_amount = vat
+        slip.total = round_money(before + vat - deduction)
+    else:
+        # Làm tròn một lần ở cuối, giống Excel: (số bình × kg − gas dư) × đơn giá (đã gồm VAT)
+        slip.total = round_money(raw_total - raw_residual - deduction)
+        before = round_money(slip.total / (1 + vat_rate)) if vat_rate else slip.total
+        slip.amount_before_tax = before
+        slip.vat_amount = slip.total - before
     if slip.total < 0:
         raise BusinessError("Thành tiền phiếu âm – kiểm tra lại gas dư / khoản trừ")
     slip.cost_total = round_money(sum((D(r.qty) * D(r.cost_at_sale) for r in rows), ZERO))
+
+
+def rebalance_vat_period(session: Session, partner_id: int, period: str) -> None:
+    """Khách tính thuế riêng (giữ số lẻ như Excel): làm tròn LŨY KẾ trong kỳ bảng kê.
+
+    Thành tiền từng phiếu = làm tròn(tổng cộng dồn tới phiếu này) − làm tròn(tổng cộng dồn tới phiếu trước),
+    nên tổng công nợ của kỳ đúng bằng ô "Tổng cộng thanh toán" Excel tính từ các số lẻ (không lệch 1–2 đồng).
+    """
+    partner = masterdata.get_partner(session, partner_id)
+    date_from, date_to = period_range(period, partner.statement_cut_day)
+    session.flush()
+    slips = session.scalars(
+        select(DeliverySlip).where(DeliverySlip.partner_id == partner_id, DeliverySlip.status == DocStatus.POSTED,
+                                   DeliverySlip.vat_mode == VatMode.EXCLUDED,
+                                   DeliverySlip.slip_date >= date_from, DeliverySlip.slip_date <= date_to)
+        .order_by(DeliverySlip.slip_date, DeliverySlip.id)).all()
+    cum = ZERO
+    prev = ZERO
+    for sl in slips:
+        exact = D(sl.amount_before_tax) + D(sl.vat_amount) - D(sl.other_deduction)
+        cum += sl.sign * exact
+        rounded = round_money(cum)
+        new_total = sl.sign * (rounded - prev)
+        prev = rounded
+        if new_total != D(sl.total):
+            sl.total = new_total
+    session.flush()
+
+
+def _rebalance_for(session: Session, slip: DeliverySlip) -> None:
+    if slip.vat_mode == VatMode.EXCLUDED:
+        partner = masterdata.get_partner(session, slip.partner_id)
+        rebalance_vat_period(session, slip.partner_id, partner.period_of(slip.slip_date))
 
 
 def _validate_header(session: Session, data: SlipInput, *, current_id: int | None = None) -> None:
@@ -236,7 +296,20 @@ def _fill_slip(session: Session, slip: DeliverySlip, data: SlipInput) -> None:
     slip.image_path = data.image_path
     slip.ocr_json = json.dumps(data.ocr_json, ensure_ascii=False) if isinstance(data.ocr_json, dict) else data.ocr_json
     slip.items = rows
-    _apply_amounts(slip, rows, raw_total, default_residual, data)
+    partner = masterdata.get_partner(session, data.partner_id)
+    vat_mode = data.vat_mode or partner.vat_mode or VatMode.INCLUDED
+    if vat_mode not in VatMode.ALL:
+        raise BusinessError(f"Cách tính thuế không hợp lệ: {vat_mode}")
+    if data.vat_rate not in (None, ""):
+        vat_rate = D(data.vat_rate)
+        if vat_rate > 1:          # nhập 8 hiểu là 8%
+            vat_rate = vat_rate / 100
+    else:
+        gas = [r for r in rows if session.get(Product, r.product_id).kind == ProductKind.GAS_CYLINDER]
+        vat_rate = D((gas or rows)[0].vat_rate)
+    if vat_rate < 0 or vat_rate >= 1:
+        raise BusinessError("Thuế suất GTGT không hợp lệ")
+    _apply_amounts(slip, rows, raw_total, default_residual, data, vat_mode=vat_mode, vat_rate=vat_rate)
 
 
 def create_slip(session: Session, data: SlipInput, *, user: str | None = None) -> SlipResult:
@@ -253,6 +326,7 @@ def create_slip(session: Session, data: SlipInput, *, user: str | None = None) -
             partner = masterdata.get_partner(session, slip.partner_id)
             warn = debts.check_credit_limit(session, partner, ZERO, slip.slip_date) if slip.doc_type == SlipType.SALE else None
             _post_effects(session, slip, data)
+            _rebalance_for(session, slip)
             if warn:
                 session.info.setdefault("warnings", []).append(warn)
             paid = round_money(data.paid_amount)
@@ -265,7 +339,8 @@ def create_slip(session: Session, data: SlipInput, *, user: str | None = None) -
                     session, voucher_type=VoucherType.RECEIPT, voucher_date=slip.slip_date, amount=paid,
                     fund_type=data.paid_fund, partner_id=slip.partner_id, category=None,
                     description=f"Thu tiền phiếu {slip.slip_no or slip.id}", payer_payee=None,
-                    ref_slip_id=slip.id, ref_purchase_id=None, allocations=[(slip.period, paid)], affects_debt=True)
+                    ref_slip_id=slip.id, ref_purchase_id=None,
+                    allocations=[(partner.period_of(slip.slip_date), paid)], affects_debt=True)
                 voucher_id = voucher.id
         elif data.assets:
             # phiếu nháp: lưu tạm thông tin tài sản trong ocr_json để áp dụng khi duyệt
@@ -300,6 +375,7 @@ def update_slip(session: Session, slip_id: int, data: SlipInput, *, user: str | 
         ensure_period_open(session, data.partner_id, data.slip_date)
         _validate_header(session, data, current_id=slip.id)
         was_posted = slip.status == DocStatus.POSTED
+        old = (slip.partner_id, slip.slip_date, slip.vat_mode)
         if was_posted:
             _remove_effects(session, slip, f"Sửa phiếu {slip.slip_no or slip.id}")
         slip.items.clear()
@@ -309,6 +385,10 @@ def update_slip(session: Session, slip_id: int, data: SlipInput, *, user: str | 
         session.flush()
         if slip.status == DocStatus.POSTED:
             _post_effects(session, slip, data)
+            _rebalance_for(session, slip)
+        if was_posted and old[2] == VatMode.EXCLUDED:
+            old_partner = masterdata.get_partner(session, old[0])
+            rebalance_vat_period(session, old[0], old_partner.period_of(old[1]))
         warnings = inventory.pop_warnings(session)
     return SlipResult(slip=slip, warnings=warnings)
 
@@ -334,6 +414,7 @@ def approve_slip(session: Session, slip_id: int, *, user: str | None = None) -> 
         slip.status = DocStatus.POSTED
         session.flush()
         _post_effects(session, slip, data)
+        _rebalance_for(session, slip)
         warnings = inventory.pop_warnings(session)
     return SlipResult(slip=slip, warnings=warnings)
 
@@ -349,6 +430,10 @@ def cancel_slip(session: Session, slip_id: int, reason: str, *, user: str | None
             _remove_effects(session, slip, f"Hủy phiếu {slip.slip_no or slip.id}: {reason}")
         slip.status = DocStatus.CANCELLED
         slip.note = f"{slip.note or ''} [HỦY: {reason}]".strip()
+        session.flush()
+        if slip.vat_mode == VatMode.EXCLUDED:
+            partner = masterdata.get_partner(session, slip.partner_id)
+            rebalance_vat_period(session, slip.partner_id, partner.period_of(slip.slip_date))
         warnings = inventory.pop_warnings(session)
         linked = session.scalars(select(cashbook.CashVoucher).where(
             cashbook.CashVoucher.ref_slip_id == slip.id,
@@ -357,6 +442,49 @@ def cancel_slip(session: Session, slip_id: int, reason: str, *, user: str | None
             warnings.append("Phiếu có phiếu thu đi kèm: " + ", ".join(v.voucher_no for v in linked)
                             + " – hãy hủy hoặc phân bổ lại phiếu thu.")
     return SlipResult(slip=slip, warnings=warnings)
+
+
+def delete_slip(session: Session, slip_id: int, *, reason: str | None = None, user: str | None = None) -> dict:
+    """Xóa hẳn phiếu (nút Xóa ở Danh sách phiếu).
+
+    - Phiếu nháp / đã hủy: xóa ngay.
+    - Phiếu đã ghi sổ: tự đảo thẻ kho + xóa vỏ mượn/đầu tư kèm phiếu (công nợ tự giảm vì tính từ phiếu), rồi xóa.
+    - Chặn khi kỳ của phiếu đã khóa sổ, hoặc phiếu còn phiếu thu đi kèm (hủy phiếu thu trước).
+    Nhật ký (audit log) vẫn giữ nội dung phiếu đã xóa.
+    """
+    session.info["user"] = user or acting_user()
+    with transaction(session):
+        slip = get_slip(session, slip_id)
+        ensure_period_open(session, slip.partner_id, slip.slip_date)
+        linked = session.scalars(select(cashbook.CashVoucher).where(
+            cashbook.CashVoucher.ref_slip_id == slip.id,
+            cashbook.CashVoucher.status == DocStatus.POSTED)).all()
+        if linked and slip.status == DocStatus.POSTED:
+            raise BusinessError("Phiếu có phiếu thu đi kèm (" + ", ".join(v.voucher_no for v in linked)
+                                + ") – hãy hủy phiếu thu ở màn hình Thu – Chi trước khi xóa phiếu.")
+        label = slip.slip_no or f"#{slip.id}"
+        was_posted = slip.status == DocStatus.POSTED
+        info = {"id": slip.id, "slip_no": slip.slip_no, "partner_id": slip.partner_id,
+                "slip_date": slip.slip_date, "total": slip.total, "was_posted": was_posted}
+        if was_posted:
+            _remove_effects(session, slip, f"Xóa phiếu {label}" + (f": {reason}" if reason else ""))
+        for v in session.scalars(select(cashbook.CashVoucher).where(cashbook.CashVoucher.ref_slip_id == slip.id)):
+            v.ref_slip_id = None
+        for mv in session.scalars(select(AssetMovement).where(AssetMovement.slip_id == slip.id)):
+            mv.slip_id = None
+        for link in session.scalars(select(VatInvoiceSlip).where(VatInvoiceSlip.slip_id == slip.id)):
+            session.delete(link)
+        from ..models import OcrJob
+        for job in session.scalars(select(OcrJob).where(OcrJob.slip_id == slip.id)):
+            job.slip_id = None
+        vat_mode, partner_id, slip_date = slip.vat_mode, slip.partner_id, slip.slip_date
+        session.delete(slip)
+        session.flush()
+        if was_posted and vat_mode == VatMode.EXCLUDED:
+            partner = masterdata.get_partner(session, partner_id)
+            rebalance_vat_period(session, partner_id, partner.period_of(slip_date))
+        info["warnings"] = inventory.pop_warnings(session)
+    return info
 
 
 def list_slips(session: Session, *, partner_id: int | None = None, site_id: int | None = None,
@@ -383,8 +511,11 @@ def gross_profit(session: Session, *, date_from: date, date_to: date, partner_id
                            status=DocStatus.POSTED):
         sign = slip.sign
         revenue += sign * D(slip.total)
-        rate = slip.items[0].vat_rate if slip.items else D("0")
-        revenue_before_tax += sign * round_money(D(slip.total) / (1 + D(rate)))
+        if slip.vat_mode == VatMode.EXCLUDED and slip.amount_before_tax is not None:
+            revenue_before_tax += sign * round_money(D(slip.total) - D(slip.vat_amount))
+        else:
+            rate = slip.vat_rate if slip.vat_rate is not None else (slip.items[0].vat_rate if slip.items else D("0"))
+            revenue_before_tax += sign * round_money(D(slip.total) / (1 + D(rate)))
         cost += sign * D(slip.cost_total)
     return {"revenue": revenue, "revenue_before_tax": revenue_before_tax, "cost": cost,
             "gross_profit": revenue_before_tax - cost}

@@ -27,6 +27,7 @@ class CompanyIn(_In):
     bank_name: Optional[str] = None
     contact_line: Optional[str] = None
     sign_city: str = "Hà Nội"
+    short_name: Optional[str] = None
 
 
 class PartnerIn(_In):
@@ -44,6 +45,10 @@ class PartnerIn(_In):
     representative_title: Optional[str] = None
     workbook_path: Optional[str] = None
     note: Optional[str] = None
+    vat_mode: str = "INCLUDED"
+    statement_template: Optional[str] = None
+    statement_cut_day: Optional[int] = Field(default=None, ge=0, le=27)
+    seller_company_id: Optional[int] = None
 
 
 class PartnerPatch(_In):
@@ -62,6 +67,10 @@ class PartnerPatch(_In):
     workbook_path: Optional[str] = None
     note: Optional[str] = None
     is_active: Optional[bool] = None
+    vat_mode: Optional[str] = None
+    statement_template: Optional[str] = None
+    statement_cut_day: Optional[int] = Field(default=None, ge=0, le=27)
+    seller_company_id: Optional[int] = None
 
 
 class SiteIn(_In):
@@ -157,6 +166,8 @@ class SlipIn(_In):
     assets: list[SlipAssetIn] = []
     paid_amount: Decimal = Decimal("0")
     paid_fund: str = FundType.CASH
+    vat_mode: Optional[str] = None          # để trống = theo khai báo của khách
+    vat_rate: Optional[Decimal] = None      # để trống = thuế suất mặt hàng (8%)
 
 
 class ReasonIn(_In):

@@ -26,9 +26,38 @@ def put_company(body: CompanyIn, session: Session = Depends(get_session)):
     return row_dict(company)
 
 
+@router.get("/companies")
+def list_companies(session: Session = Depends(get_session)):
+    """Các đơn vị bán hàng (dòng đầu = công ty chính). Khách có thể chọn đơn vị bán in trên bảng kê."""
+    return [row_dict(c) for c in masterdata.list_companies(session)]
+
+
+@router.post("/companies", status_code=201)
+def create_company(body: CompanyIn, session: Session = Depends(get_session)):
+    with transaction(session):
+        company = masterdata.create_company(session, **body.model_dump())
+    return row_dict(company)
+
+
+@router.put("/companies/{company_id}")
+def update_company(company_id: int, body: CompanyIn, session: Session = Depends(get_session)):
+    with transaction(session):
+        company = masterdata.update_company(session, company_id, **body.model_dump())
+    return row_dict(company)
+
+
+@router.delete("/companies/{company_id}")
+def delete_company(company_id: int, session: Session = Depends(get_session)):
+    with transaction(session):
+        masterdata.delete_company(session, company_id)
+    return {"deleted": True}
+
+
 @router.get("/partners")
-def list_partners(partner_type: Optional[str] = None, q: Optional[str] = None, session: Session = Depends(get_session)):
-    return [row_dict(p) for p in masterdata.list_partners(session, partner_type=partner_type, q=q)]
+def list_partners(partner_type: Optional[str] = None, q: Optional[str] = None, include_inactive: bool = False,
+                  session: Session = Depends(get_session)):
+    return [row_dict(p) for p in masterdata.list_partners(session, partner_type=partner_type, q=q,
+                                                          include_inactive=include_inactive)]
 
 
 @router.post("/partners", status_code=201)
@@ -48,6 +77,21 @@ def patch_partner(partner_id: int, body: PartnerPatch, session: Session = Depend
     with transaction(session):
         partner = masterdata.update_partner(session, partner_id, **body.model_dump(exclude_unset=True))
     return row_dict(partner)
+
+
+@router.get("/partners/{partner_id}/usage")
+def partner_usage(partner_id: int, session: Session = Depends(get_session)):
+    """Số chứng từ đã phát sinh – để màn hình hỏi Xóa hay Ngừng theo dõi."""
+    masterdata.get_partner(session, partner_id)
+    used = masterdata.partner_usage(session, partner_id)
+    return {"usage": used, "can_delete": not used}
+
+
+@router.delete("/partners/{partner_id}")
+def delete_partner(partner_id: int, deactivate_if_used: bool = False, session: Session = Depends(get_session)):
+    """Xóa khách/NCC chưa có chứng từ. Đã có chứng từ: lỗi 400, hoặc ngừng theo dõi khi deactivate_if_used=true."""
+    with transaction(session):
+        return masterdata.delete_partner(session, partner_id, deactivate_if_used=deactivate_if_used)
 
 
 @router.get("/partners/{partner_id}/sites")

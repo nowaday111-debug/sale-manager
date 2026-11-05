@@ -30,6 +30,8 @@ from ..models import (
     Site,
     Statement,
     StatementStatus,
+    StatementTemplate,
+    VatMode,
 )
 from ..money import ZERO, D, normalize
 from ..utils.so_thanh_chu import so_thanh_chu
@@ -37,13 +39,9 @@ from . import assets as asset_svc
 from . import debts, masterdata
 
 
-def period_bounds(period: str) -> tuple[date, date]:
-    try:
-        y, m = (int(x) for x in period.split("-"))
-        first = date(y, m, 1)
-    except (ValueError, TypeError) as exc:
-        raise BusinessError(f"Kỳ phải dạng YYYY-MM: {period}") from exc
-    return first, date(y, m, calendar.monthrange(y, m)[1])
+def period_bounds(period: str, cut_day: int | None = None) -> tuple[date, date]:
+    from .locks import period_range
+    return period_range(period, cut_day)
 
 
 def _month_label(period: str) -> str:
@@ -96,6 +94,12 @@ def _slip_row(slip: DeliverySlip, asset_notes: list[str]) -> dict:
         "net_kg": sign * (gross_kg - residual) if qty_by_sku else None,
         "unit_price": unit_price, "price_basis": basis,
         "amount": sign * D(slip.total),
+        "vat_mode": slip.vat_mode or VatMode.INCLUDED,
+        "vat_rate": D(slip.vat_rate) if slip.vat_rate is not None else None,
+        "amount_before_tax": sign * D(slip.amount_before_tax) if slip.amount_before_tax is not None else None,
+        "vat_amount": sign * D(slip.vat_amount) if slip.vat_amount is not None else None,
+        "site_name": slip.site.name if slip.site else None,
+        "other_deduction": sign * D(slip.other_deduction or ZERO),
         "extra_items": extra,
         "note": "; ".join(notes) if notes else None,
         "staff": slip.staff,
@@ -105,8 +109,8 @@ def _slip_row(slip: DeliverySlip, asset_notes: list[str]) -> dict:
 def build_statement(session: Session, partner_id: int, period: str, *, sign_date: date | None = None,
                     words_style: str | None = None) -> dict:
     partner = masterdata.get_partner(session, partner_id)
-    company = masterdata.get_company(session)
-    date_from, date_to = period_bounds(period)
+    company = masterdata.get_seller_for(session, partner)
+    date_from, date_to = period_bounds(period, partner.statement_cut_day)
     sign_date = sign_date or date_to
     style = words_style or settings.amount_words_style
 
@@ -165,6 +169,8 @@ def build_statement(session: Session, partner_id: int, period: str, *, sign_date
                 "gas_residual_kg": sum((r["gas_residual_kg"] for r in slip_rows), ZERO),
                 "net_kg": sum((r["net_kg"] or ZERO for r in slip_rows), ZERO),
                 "amount": sum((r["amount"] for r in slip_rows), ZERO),
+                "amount_before_tax": _sum_opt(r["amount_before_tax"] for r in slip_rows),
+                "vat_amount": _sum_opt(r["vat_amount"] for r in slip_rows),
             },
         })
 
@@ -179,7 +185,11 @@ def build_statement(session: Session, partner_id: int, period: str, *, sign_date
         "gas_residual_kg": sum((b["totals"]["gas_residual_kg"] for b in blocks), ZERO),
         "net_kg": sum((b["totals"]["net_kg"] for b in blocks), ZERO),
         "amount": sum((b["totals"]["amount"] for b in blocks), ZERO),
+        "amount_before_tax": _sum_opt(b["totals"]["amount_before_tax"] for b in blocks),
+        "vat_amount": _sum_opt(b["totals"]["vat_amount"] for b in blocks),
     }
+    vat_rates = sorted({r["vat_rate"] for b in blocks for r in b["rows"]
+                        if r["kind"] == "slip" and r.get("vat_rate") is not None})
 
     # nợ các tháng trước (tính tới hết ngày trước kỳ)
     prior_rows = []
@@ -231,15 +241,21 @@ def build_statement(session: Session, partner_id: int, period: str, *, sign_date
     closing = total_debt - total_paid
     ledger_balance = debts.balance(session, partner_id, DebtSide.RECEIVABLE, as_of=date_to)
 
+    y, m = (int(x) for x in period.split("-"))
     return {
         "period": period,
-        "sheet_name": f"T{date_from.month}.{date_from.year}",
+        "template": partner.statement_template or StatementTemplate.STANDARD,
+        "vat_mode": partner.vat_mode or VatMode.INCLUDED,
+        "vat_rates": vat_rates,
+        "cut_day": partner.statement_cut_day,
+        "sheet_name": f"T{m}.{y}",
         "date_from": date_from, "date_to": date_to, "sign_date": sign_date,
         "period_text": f"Từ ngày {date_from:%d/%m/%Y} đến hết ngày {date_to:%d/%m/%Y}",
         "sign_text": f"{company.sign_city}, ngày {sign_date.day:02d} tháng {sign_date.month:02d} năm {sign_date.year}",
         "seller": {"parent_name": company.parent_name, "name": company.name, "address": company.address,
                    "tax_code": company.tax_code, "phones": company.phones, "bank_account": company.bank_account,
-                   "bank_name": company.bank_name, "contact_line": company.contact_line},
+                   "bank_name": company.bank_name, "contact_line": company.contact_line,
+                   "sign_city": company.sign_city},
         "buyer": {"partner_id": partner.id, "code": partner.code, "name": partner.name, "address": partner.address,
                   "tax_code": partner.tax_code, "phone": partner.phone, "contact_name": partner.contact_name},
         "cylinder_columns": columns,
@@ -253,9 +269,15 @@ def build_statement(session: Session, partner_id: int, period: str, *, sign_date
         "total_paid": total_paid,
         "closing_debt": closing,
         "amount_in_words": so_thanh_chu(closing, style=style),
+        "period_words": so_thanh_chu(grand["amount"], style=style),
         "ledger_balance": ledger_balance,
         "balanced": ledger_balance == closing,
     }
+
+
+def _sum_opt(values) -> Decimal | None:
+    vals = [v for v in values if v is not None]
+    return sum(vals, ZERO) if vals else None
 
 
 def _total_loans(per_site) -> str:
